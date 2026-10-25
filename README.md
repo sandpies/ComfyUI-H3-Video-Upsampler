@@ -54,7 +54,7 @@ existing clip, as this node does, does not.
 
 ## Credits
 
-Built in [ComfyUI-Hand-Tie-Clips](https://github.com/dntpi/ComfyUI-Hand-Tie-Clips), where the same upsampler runs over a
+Built in [ComfyUI-Hand-Tie-Clips](https://github.com/sandpies/ComfyUI-Hand-Tie-Clips), where the same upsampler runs over a
 whole chain. Latent upscaler network: LBH-123-AI. Upscale recipe: bbaudio-2025's
 MMH3 Ultimate Upscale. Guide layout and dataset: Alissonerdx. See
 `THIRD_PARTY_NOTICES.md`.

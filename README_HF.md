@@ -12,7 +12,7 @@ tags:
 
 # H3 Video Upsampler + h3upscale x2 LoRA
 
-> Code: [GitHub](https://github.com/dntpi/ComfyUI-H3-Video-Upsampler). The LoRA is in [`lora/`](./lora).
+> Code: [GitHub](https://github.com/sandpies/ComfyUI-H3-Video-Upsampler). The LoRA is in [`lora/`](./lora).
 
 Upscale a **finished** MiniMax H3 clip (or any clip) in ComfyUI: the H3 latent
 upscaler enlarges it, then a light two-step re-draw in tiles restores detail. With the
@@ -66,7 +66,7 @@ existing clip, as this node does, does not.
 
 ## Credits
 
-Built in [ComfyUI-Hand-Tie-Clips](https://github.com/dntpi/ComfyUI-Hand-Tie-Clips), where the same upsampler runs over a
+Built in [ComfyUI-Hand-Tie-Clips](https://github.com/sandpies/ComfyUI-Hand-Tie-Clips), where the same upsampler runs over a
 whole chain. Latent upscaler network: LBH-123-AI. Upscale recipe: bbaudio-2025's
 MMH3 Ultimate Upscale. Guide layout and dataset: Alissonerdx. See
 `THIRD_PARTY_NOTICES.md`.

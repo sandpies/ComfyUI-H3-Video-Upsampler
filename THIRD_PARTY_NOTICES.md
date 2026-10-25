@@ -1,6 +1,6 @@
 # Third-party notices
 
-The code here is generated from [ComfyUI-Hand-Tie-Clips](https://github.com/dntpi/ComfyUI-Hand-Tie-Clips) (MIT).
+The code here is generated from [ComfyUI-Hand-Tie-Clips](https://github.com/sandpies/ComfyUI-Hand-Tie-Clips) (MIT).
 
 ## `tiled_upsampler.py` — the H3 latent upscaler's layout and statistics
 

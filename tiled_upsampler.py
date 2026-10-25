@@ -1,4 +1,4 @@
-# Generated from ComfyUI-Hand-Tie-Clips (https://github.com/dntpi/ComfyUI-Hand-Tie-Clips) by tools/build_upsampler_pack.py.
+# Generated from ComfyUI-Hand-Tie-Clips (https://github.com/sandpies/ComfyUI-Hand-Tie-Clips) by tools/build_upsampler_pack.py.
 # Edit it there, not here: the next build overwrites this file.
 """HTC Tiled Upsampler -- a finished H3 clip made bigger and sharper, in one node.
 

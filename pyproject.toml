@@ -6,7 +6,7 @@ license = { file = "LICENSE" }
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/dntpi/ComfyUI-H3-Video-Upsampler"
+Repository = "https://github.com/sandpies/ComfyUI-H3-Video-Upsampler"
 
 [tool.comfy]
 PublisherId = "sandpies"
