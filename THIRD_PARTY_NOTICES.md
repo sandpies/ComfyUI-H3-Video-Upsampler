@@ -31,7 +31,7 @@ grid) is the layout of [Alissonerdx](https://huggingface.co/Alissonerdx)'s
 ai-toolkit fork, branch `minimax-h3-latent-guides` (ai-toolkit: MIT). No code
 was copied; this pack's checker compared the two layouts row for row.
 
-## `lora/h3upscale_v2_x2.safetensors`
+## `lora/h3upscale_v2_x2.safetensors` (retired, kept on Hugging Face)
 
 Trained by Sandpies with that fork on Alissonerdx's
 [h3upscale-4k](https://huggingface.co/datasets/Alissonerdx/h3upscale-4k)

@@ -40,6 +40,7 @@ from __future__ import annotations
 import collections
 import math
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -61,6 +62,7 @@ MAX_GRID_SIDE = 9           # tile grid search limit per axis
 SCHEDULER, STEPS, DENOISE = "simple", 1, 0.2
 SEED = 444
 UPSCALER_DTYPE = torch.float16
+_FLUSH_S = [0.0]           # seconds spent in sample_tile's cache flush (log only)
 
 # --- the guided re-draw (not part of the recipe) ----------------------------
 #
@@ -870,7 +872,7 @@ def recipe_sigmas(model, denoise=DENOISE, steps=STEPS, start_sigma=0.0):
     return sig[-(steps + 1):]
 
 
-def _apply_low_vram_patches(model):
+def _apply_low_vram_patches(model, attn_chunks=4, ffn_chunks=2):
     """Apply AdaLN port, 4-way attention head chunking, and 2-way SwiGLU FFN
     token chunking (as in Seanaiochat.json's MiniMaxLowVRAMAttention(4) +
     MiniMaxChunkFeedForward(2, 4096)) onto `model` so tiled upsampling uses
@@ -884,12 +886,13 @@ def _apply_low_vram_patches(model):
         if hasattr(model, "patches") and "H3AdaLNLoRAFix" in nmap:
             _res = nmap["H3AdaLNLoRAFix"].execute(model=model, mode="port")
             model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
-        if "MiniMaxLowVRAMAttention" in nmap:
-            _res = nmap["MiniMaxLowVRAMAttention"].execute(model=model, head_chunks=4)
+        if int(attn_chunks) > 1 and "MiniMaxLowVRAMAttention" in nmap:
+            _res = nmap["MiniMaxLowVRAMAttention"].execute(
+                model=model, head_chunks=int(attn_chunks))
             model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
-        if "MiniMaxChunkFeedForward" in nmap:
+        if int(ffn_chunks) > 1 and "MiniMaxChunkFeedForward" in nmap:
             _res = nmap["MiniMaxChunkFeedForward"].execute(
-                model=model, chunks=2, seq_threshold=4096)
+                model=model, chunks=int(ffn_chunks), seq_threshold=4096)
             model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
     except Exception:
         pass
@@ -926,7 +929,9 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed):
                         seed=seed)
     res = out.to(mm.intermediate_device()).tensors[0]
     del out, guider, samples, mask
+    _t = time.perf_counter()
     mm.soft_empty_cache()
+    _FLUSH_S[0] += time.perf_counter() - _t
     return res
 
 
@@ -990,7 +995,7 @@ def _cond_extra_tokens(cond):
 
 def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
-                 detail_sigma=0.0):
+                 detail_sigma=0.0, noise_video=None):
     """Every tile stepped together, merged under the feather after each step.
 
     Step 0 hands each tile its slice of one noise field drawn at the chunk's
@@ -1008,6 +1013,10 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     _, _, t, h, w = video.shape
     field = comfy.sample.prepare_noise(nt.NestedTensor((video, audio)), seed)
     nv, na = field.tensors[0], field.tensors[1]
+    if noise_video is not None:
+        # This chunk's frames of one film-wide field (noise=film): the frames
+        # two chunks share get the same noise from both sides.
+        nv = noise_video.to(device=nv.device, dtype=nv.dtype)
     dev, dt = video.device, video.dtype
     cur_budget = int(budget)
 
@@ -1034,6 +1043,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
         # (flow) model, i.e. x_t / (1 - sigma); the next call's zero-noise
         # noise_scaling multiplies it back by (1 - sigma), so the hand-off is
         # exact. Only step 0 draws noise, from one full-chunk field.
+        _t0, _calls, _FLUSH_S[0] = time.perf_counter(), 0, 0.0
         try:
             x = video
             if len(prepared) == 1:
@@ -1045,6 +1055,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                 xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
                 noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
                 ot = sample_tile(model, tcond, sampler, sigmas, xt, audio, noise, seed)
+                _calls += 1
                 x = ot.to(device=dev, dtype=dt)
                 del ot, xt
             else:
@@ -1059,12 +1070,17 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                         else:
                             noise = (torch.zeros_like(xt), torch.zeros_like(audio))
                         ot = sample_tile(model, tcond, sampler, two, xt, audio, noise, seed)
+                        _calls += 1
                         acc[:, :, :, r0:r0 + rows, c0:c0 + cols] += \
                             ot.to(device=dev, dtype=torch.float32) * m
                         wsum[:, :, :, r0:r0 + rows, c0:c0 + cols] += m[:, :, 0]
                         del ot, xt
                     x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
                     del acc, wsum
+            _dt = time.perf_counter() - _t0
+            print(f"[{TAG}] chunk re-draw: {len(sigmas) - 1} step(s) x {len(prepared)} tile(s) "
+                  f"in {_calls} sampler call(s), {_dt:.1f} s ({_dt / max(1, _calls):.2f} s per call, "
+                  f"cache flush {_FLUSH_S[0]:.1f} s)", flush=True)
             break
         except Exception as exc:
             if not _is_oom(exc) or cur_budget <= 16384:
@@ -1131,7 +1147,10 @@ def _free(model):
 
 def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              denoise=DENOISE, guide=None, budget=TOKEN_BUDGET, steps=STEPS,
-             start_sigma=0.0, overlap_px=TILE_OVERLAP_PX, detail_sigma=0.0):
+             start_sigma=0.0, overlap_px=TILE_OVERLAP_PX, detail_sigma=0.0,
+             chunk_frames=CHUNK_FRAMES, chunk_overlap=CHUNK_OVERLAP,
+             anchor=ANCHOR_AUG, seed=SEED, noise="per_chunk",
+             attn_chunks=4, ffn_chunks=2):
     """The whole recipe on an H3 AV latent. -> the upsampled AV latent dict.
 
     `conditioning` is one conditioning for the whole clip, or a callable
@@ -1169,9 +1188,9 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     else:
         w_px, h_px = target_size(video.shape[4] * SPATIAL, video.shape[3] * SPATIAL,
                                  megapixels)
-    model = _apply_low_vram_patches(model)
+    model = _apply_low_vram_patches(model, attn_chunks, ffn_chunks)
     sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
-    plan = chunks(tv)
+    plan = chunks(tv, int(chunk_frames), int(chunk_overlap))
     print(f"[{TAG}] {video.shape[4] * SPATIAL}x{video.shape[3] * SPATIAL} -> "
           f"{w_px}x{h_px} ({w_px * h_px / 1048576.0:.2f} MP), {len(plan)} "
           f"chunk(s), "
@@ -1189,6 +1208,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     #            latents, store on CPU RAM (~6 MB/chunk), then offload upscaler.
     #   Phase 3: Stage the 32.4 GB H3 DiT onto GPU ONCE and step all chunks
     #            without unloading/re-staging the DiT between chunks.
+    _tp = [time.perf_counter()]
     if _device().type == "cuda":
         _free(model)
     raw_cvs = [video[:, :, k0:k1].contiguous() for (k0, _f0, k1, _f1) in plan]
@@ -1203,9 +1223,18 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         if _device().type == "cuda":
             _free_all_gpu()
 
+    _tp.append(time.perf_counter())
     upscaled_cvs = upscale_chunks_batch(raw_cvs, upscaler, w_px, h_px)
     del raw_cvs
+    _tp.append(time.perf_counter())
 
+    film_nv = None
+    if str(noise) == "film" and sigmas is not None and upscaled_cvs:
+        _c0 = upscaled_cvs[0]
+        film_nv = torch.randn(
+            (1, int(_c0.shape[1]), tv, int(_c0.shape[3]), int(_c0.shape[4])),
+            generator=torch.Generator().manual_seed(int(seed)),
+            dtype=torch.float32, device="cpu").to(dtype=_c0.dtype)
     done_v = done_a = None
     for i, (k0, f0, k1, f1) in enumerate(plan):
         a0, a1 = audio_span(f0, f1)
@@ -1218,7 +1247,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         ccond = cond_for_chunk(clean_refs(conditioning(f0, f1)) if per_chunk
                                else cond, f0, f1, cv.shape[3], cv.shape[4])
         if i > 0:
-            ccond = pin_chunk_start(ccond, done_v, f0)
+            ccond = pin_chunk_start(ccond, done_v, f0, anchor)
         glat = glats[i]
         glats[i] = None
         if glat is not None:
@@ -1229,11 +1258,17 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                                    f"needs {want} (steps, rows, cols)")
             ccond = add_guide(ccond, glat.to(cv.device, cv.dtype), factor)
             del glat
-        out_v = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, SEED, factor, budget,
-                             overlap_px, detail_sigma=detail_sigma)
+        out_v = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, int(seed), factor, budget,
+                             overlap_px, detail_sigma=detail_sigma,
+                             noise_video=(None if film_nv is None
+                                          else film_nv[:, :, k0:k1]))
         done_v, done_a = join_chunk(done_v, done_a, out_v, ca, k0, f0)
         del cv, out_v
     _free(model)
+    _tp.append(time.perf_counter())
+    print(f"[{TAG}] timing: guide prep {_tp[1] - _tp[0]:.1f} s, 3D upscale "
+          f"{_tp[2] - _tp[1]:.1f} s, re-draw + join {_tp[3] - _tp[2]:.1f} s "
+          f"({len(plan)} chunk(s))", flush=True)
     return {"samples": nt.NestedTensor((done_v, done_a))}
 
 
@@ -1342,7 +1377,7 @@ def match_levels(frames, ref, chunk=16, in_place=False):
 
 def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
                    upscaler=UPSCALER_FILE, decode=None, denoise=DENOISE,
-                   alloc=None, guide=None, budget=TOKEN_BUDGET):
+                   alloc=None, guide=None, budget=TOKEN_BUDGET, settings=None):
     """The recipe over a finished chain. -> (IMAGE [N,H,W,3], note).
 
     `hops` are per-hop dicts: video/audio (the hop's delivered sampler
@@ -1367,26 +1402,34 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             return torch.empty((n, h, w, 3), dtype=torch.float32)
     if guide is not None and guide.decode is None:
         guide = guide._replace(decode=decode)
-    model = _apply_low_vram_patches(model)
-    # 2-step re-draw on the `upsample_denoise` schedule (`[0.5714, 0.3871, 0.0]`
-    # at `denoise=0.1`, `[0.7500, 0.5714, 0.0]` at `denoise=0.2` under H3's
-    # `shift=12` curve) + 192px raised-cosine tile overlap so an undistilled
-    # `upsample_dit` follows the curved trajectory cleanly while preserving 100%
-    # of `h3upscale`'s structural and fine-detail restoration.
-    _chain_steps = 2 if float(denoise) > 0.0 else STEPS
+    st = resolve_settings(settings)
+    if st["sampler"] is not None:
+        sampler = st["sampler"]
+    model = _apply_low_vram_patches(model, st["attn_chunks"], st["ffn_chunks"])
+    # Unwired settings run the original recipe: one step from sigma 0.75
+    # (`upsample_denoise=0.2` under H3's `shift=12` curve), 128 px tile overlap.
+    # 3.0.0 ran 2 steps at 0.1 with 192 px; HTCUpsampleSettings can still.
+    _chain_steps = int(st["steps"]) if float(denoise) > 0.0 else STEPS
     want = sum(int(h["frames"]) for h in hops)
     frames, at, runs = None, 0, 0
-    for seg in segments(hops):
+    _segs = segments(hops)
+    for seg in _segs:
+        _t0 = time.perf_counter()
         v, a = stitch(seg)
         lat = {"samples": nt.NestedTensor((v, a))}
         out = upsample(model, cond_by_frame(seg), lat, sampler, upscaler,
                        megapixels, denoise, guide=guide, budget=budget,
-                       steps=_chain_steps, start_sigma=0.0,
-                       overlap_px=192, detail_sigma=0.0)
+                       steps=_chain_steps,
+                       start_sigma=(st["start_sigma"] if float(denoise) > 0.0 else 0.0),
+                       overlap_px=st["tile_overlap_px"], detail_sigma=st["detail_sigma"],
+                       chunk_frames=st["chunk_frames"], chunk_overlap=st["chunk_overlap"],
+                       anchor=st["anchor_strength"], seed=st["seed"], noise=st["noise"],
+                       attn_chunks=st["attn_chunks"], ffn_chunks=st["ffn_chunks"])
         vid = out["samples"].tensors[0]
         _free(model)
         if _device().type == "cuda":
             _free_all_gpu()
+        _t1 = time.perf_counter()
         tv_seg = int(vid.shape[2])
         if vae is not None and tv_seg > 32:
             # Stream-decode in 30-token (102-frame) windows with a 5-token (17-frame)
@@ -1431,6 +1474,11 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             del part
             at += n
         runs += 1
+        print(f"[{TAG}] run {runs}/{len(_segs)} (hop {seg[0]['hop']}"
+              + (f"-{seg[-1]['hop']}" if len(seg) > 1 else "")
+              + f"): upsample {_t1 - _t0:.1f} s, decode"
+              + (" + level match" if master is not None else "")
+              + f" {time.perf_counter() - _t1:.1f} s", flush=True)
     if at != want:
         raise ValueError(f"the upsampled film is {at} frames, "
                          f"the chain delivered {want}")
@@ -1484,5 +1532,127 @@ class HTCTiledUpsampler:
         return (images, vae_decode_audio(audio_vae, out))
 
 
-NODE_CLASS_MAPPINGS = {"HTCTiledUpsampler": HTCTiledUpsampler}
-NODE_DISPLAY_NAME_MAPPINGS = {"HTCTiledUpsampler": "H3 Tiled Upsampler"}
+# --- the chain's upsample settings -------------------------------------------
+#
+# HandTieClips' upsample_settings socket. Unwired, the chain runs exactly
+# these defaults: the original recipe (one simple step, 102 / 17 f chunks,
+# anchor 0.999, 70000-token tiles with 128 px overlap, seed 444). 3.0.0 ran
+# 2 steps at 0.1 with 192 px; measured 10-25 on one 576p -> 2 MP clip, the
+# recipe's single step from 0.75 kept 14% more fine detail.
+
+SETTINGS_TYPE = "HTC_UPSAMPLE"
+CHAIN_DEFAULTS = {
+    "steps": STEPS, "start_sigma": 0.0, "noise": "per_chunk", "seed": SEED,
+    "chunk_frames": CHUNK_FRAMES, "chunk_overlap": CHUNK_OVERLAP,
+    "anchor_strength": ANCHOR_AUG, "tile_overlap_px": TILE_OVERLAP_PX, "detail_sigma": 0.0,
+    "attn_chunks": 4, "ffn_chunks": 2, "sampler": None,
+}
+
+
+def resolve_settings(settings):
+    """The settings node's dict over the chain defaults. -> a full dict."""
+    out = dict(CHAIN_DEFAULTS)
+    for k, v in (settings or {}).items():
+        if k in out:
+            out[k] = v
+    if int(out["chunk_overlap"]) >= int(out["chunk_frames"]):
+        raise ValueError(f"{TAG}: chunk_overlap ({out['chunk_overlap']}) must be "
+                         f"smaller than chunk_frames ({out['chunk_frames']})")
+    return out
+
+
+class HTCUpsampleSettings:
+    """Every setting of the chain's upsample, for HandTieClips' upsample_settings."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        d = CHAIN_DEFAULTS
+        return {
+            "required": {
+                "steps": ("INT", {
+                    "default": d["steps"], "min": 1, "max": 8,
+                    "tooltip": "Re-draw steps per chunk. 1 = the original recipe (one "
+                               "jump from sigma 0.75 at upsample_denoise 0.2). Each step "
+                               "is one more DiT pass over the chunk."}),
+                "start_sigma": ("FLOAT", {
+                    "default": d["start_sigma"], "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "0 = the schedule from upsample_denoise (0.2 at 1 step "
+                               "gives 0.75 -> 0, the recipe). Above 0 the re-draw starts at this "
+                               "sigma and follows the model's schedule down to 0 in "
+                               "`steps` steps: 0.57 at 2 steps is 3.0.0's schedule, "
+                               "0.57 at 3 steps ends 0.29 -> 0, 0.45 at 2 ends 0.28 -> 0. "
+                               "upsample_denoise must still be above 0."}),
+                "noise": (["per_chunk", "film"], {
+                    "default": d["noise"],
+                    "tooltip": "per_chunk: every chunk draws the same noise from its own "
+                               "first frame (the original recipe). film: one noise field "
+                               "for the whole film, so the frames two chunks share get "
+                               "the same noise from both sides."}),
+                # Not named seed: ComfyUI hangs a randomize control on any
+                # widget called seed, and the recipe's 444 must stay fixed.
+                "redraw_seed": ("INT", {
+                    "default": d["seed"], "min": 0, "max": 0x7FFFFFFF,
+                    "tooltip": "Noise seed of the re-draw (the recipe uses 444). Fixed: "
+                               "it does not change between runs."}),
+                "chunk_frames": ("INT", {
+                    "default": d["chunk_frames"], "min": 34, "max": 1020, "step": 17,
+                    "tooltip": "Frames per time chunk, a multiple of 17. Longer chunks "
+                               "mean fewer joins but more tokens per pass (more tiles "
+                               "or more VRAM)."}),
+                "chunk_overlap": ("INT", {
+                    "default": d["chunk_overlap"], "min": 17, "max": 1003, "step": 17,
+                    "tooltip": "Frames two chunks share and crossfade over, a multiple "
+                               "of 17, smaller than chunk_frames."}),
+                "anchor_strength": ("FLOAT", {
+                    "default": d["anchor_strength"], "min": 0.0, "max": 1.0, "step": 0.001,
+                    "tooltip": "How hard each chunk's first frame is pinned to what the "
+                               "previous chunk drew there. 0.999 = H3's default."}),
+                "tile_overlap_px": ("INT", {
+                    "default": d["tile_overlap_px"], "min": 0, "max": 512, "step": 32,
+                    "tooltip": "Overlap between spatial tiles, in pixels (128 = the "
+                               "recipe). Only matters when a chunk splits into tiles."}),
+                "detail_sigma": ("FLOAT", {
+                    "default": d["detail_sigma"], "min": 0.0, "max": 32.0, "step": 0.5,
+                    "tooltip": "0 = off. Above 0, keeps the 3D upscaler's large shapes "
+                               "(blurred at this many latent px) and takes only the finer "
+                               "detail from the re-draw. For tile-grid shifts, not a "
+                               "sharpness control."}),
+                "attn_chunks": ("INT", {
+                    "default": d["attn_chunks"], "min": 1, "max": 16,
+                    "tooltip": "Attention split into this many head groups to save VRAM. "
+                               "Keep 4. Lower needs far more VRAM: 1 / 1 on a 32 GB card "
+                               "at 1-2 MP spills into system RAM and stalls the PC. Same "
+                               "result either way."}),
+                "ffn_chunks": ("INT", {
+                    "default": d["ffn_chunks"], "min": 1, "max": 16,
+                    "tooltip": "Feed-forward split into this many token groups to save "
+                               "VRAM. Keep 2 or raise it on smaller cards; 1 needs far "
+                               "more VRAM. Same result either way."}),
+            },
+            "optional": {
+                "sampler": ("SAMPLER", {
+                    "tooltip": "Sampler for the re-draw. Unwired uses the chain's. "
+                               "Multistep samplers only keep their history when a chunk "
+                               "is one tile."}),
+            },
+        }
+
+    RETURN_TYPES = (SETTINGS_TYPE,)
+    RETURN_NAMES = ("upsample_settings",)
+    FUNCTION = "build"
+    CATEGORY = "Hand Tie Clips"
+    DESCRIPTION = ("Settings for HandTieClips' upsample. Wire into its upsample_settings "
+                   "socket; unwired, the chain uses these defaults.")
+
+    def build(self, sampler=None, **kw):
+        out = dict(kw)
+        out["seed"] = out.pop("redraw_seed", SEED)
+        out["sampler"] = sampler
+        resolve_settings(out)
+        return (out,)
+
+
+NODE_CLASS_MAPPINGS = {"HTCTiledUpsampler": HTCTiledUpsampler,
+                       "HTCUpsampleSettings": HTCUpsampleSettings}
+NODE_DISPLAY_NAME_MAPPINGS = {"HTCTiledUpsampler": "H3 Tiled Upsampler",
+                              "HTCUpsampleSettings": "HTC Upsample Settings"}

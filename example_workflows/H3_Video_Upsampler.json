@@ -24,7 +24,7 @@
     "Node name for S&R": "MarkdownNote"
    },
    "widgets_values": [
-    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip (put it in `ComfyUI/input`). Any size; 24 fps is what H3\n   assumes, other rates work but the soundtrack conditions the re-draw loosely.\n2. **Queue.** It saves to `video/H3_upsampled` at the clip's own fps, with its\n   own soundtrack untouched.\n\n### The node\n- **megapixels**: output size, aspect kept (2 = about 1920x1080).\n- **denoise**: fraction of the schedule the two re-draw steps cover (as the chain's upsample_denoise). 0.1 is the setting that held; 0 only enlarges.\n- **lora**: set to `h3upscale_v2_x2.safetensors` (put it in `models/loras`); an **h3upscale** LoRA is detected from its header and gets its guide (the clip at\n  half the output size) in those steps, so the re-draw restores the clip's own detail\n  instead of inventing texture. Wire the **plain** UNETLoader as `model` for it (as here):\n  it was trained on the bare DiT. Other LoRAs just sit on the re-draw.\n- **tile_tokens**: VRAM. Lower = more, smaller tiles, slower, less memory. 70000 is the\n  recipe; try 40000 or 25000 on a smaller card.\n- **audio_vae** wired = the re-draw hears the soundtrack; unwired = it hears silence.\n\nMouths and motion come from the clip; only fine detail is re-drawn."
+    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip (put it in `ComfyUI/input`). Any size; 24 fps is what H3\n   assumes, other rates work but the soundtrack conditions the re-draw loosely.\n2. **Queue.** H3 Save Video writes it to `video/H3_upsampled` at the clip's own fps,\n   with its own soundtrack untouched (NVENC when there is a GPU). Set its `frame_gen` to x2 for\n   double the frame rate (RTX GPU + `nvidia-vfx`).\n\n### The node\n- **megapixels**: output size, aspect kept (2 = about 1920x1080).\n- **denoise**: as the chain's upsample_denoise. 0.2 is the original recipe (one re-draw step from sigma 0.75); 0 only enlarges.\n- **lora**: retired and ignored. The re-draw runs the original recipe with no LoRA.\n- **tile_tokens**: VRAM. Lower = more, smaller tiles, slower, less memory. 70000 is the\n  recipe; try 40000 or 25000 on a smaller card.\n- **audio_vae** wired = the re-draw hears the soundtrack; unwired = it hears silence.\n\nMouths and motion come from the clip; only fine detail is re-drawn."
    ]
   },
   {
@@ -56,7 +56,7 @@
     "Node name for S&R": "UNETLoader"
    },
    "widgets_values": [
-    "Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors",
+    "minimax_h3_ref2va_int8_convrot.safetensors",
     "default"
    ],
    "title": "Load Diffusion Model (plain, no LoRAs)"
@@ -338,8 +338,8 @@
     "h3upscale, increase resolution and restore fine details while preserving the original content and visual style.",
     "minimax_h3_latent_upscaler_3d_bf16.safetensors",
     2.0,
-    0.1,
-    "h3upscale_v2_x2.safetensors",
+    0.2,
+    "None",
     1.0,
     70000,
     "euler"
@@ -374,14 +374,14 @@
   },
   {
    "id": 10,
-   "type": "CreateVideo",
+   "type": "H3SaveVideo",
    "pos": [
     420,
     -560
    ],
    "size": [
-    260,
-    130
+    340,
+    300
    ],
    "flags": {},
    "order": 9,
@@ -395,127 +395,44 @@
     {
      "name": "audio",
      "type": "AUDIO",
-     "link": 10,
-     "shape": 7
+     "link": 10
     },
     {
      "name": "fps",
      "type": "FLOAT",
-     "link": 11,
      "widget": {
       "name": "fps"
-     }
-    },
-    {
-     "name": "bit_depth",
-     "type": "COMBO",
-     "link": null,
-     "shape": 7,
-     "widget": {
-      "name": "bit_depth"
-     }
-    },
-    {
-     "name": "color_space",
-     "type": "COMBO",
-     "link": null,
-     "shape": 7,
-     "widget": {
-      "name": "color_space"
-     }
+     },
+     "link": 11
     }
    ],
    "outputs": [
     {
-     "name": "VIDEO",
-     "type": "VIDEO",
-     "links": [
-      12
-     ],
-     "slot_index": 0
-    }
-   ],
-   "properties": {
-    "Node name for S&R": "CreateVideo"
-   },
-   "widgets_values": [
-    24,
-    "auto",
-    "sRGB"
-   ]
-  },
-  {
-   "id": 11,
-   "type": "SaveVideo",
-   "pos": [
-    420,
-    -380
-   ],
-   "size": [
-    420,
-    420
-   ],
-   "flags": {},
-   "order": 10,
-   "mode": 0,
-   "inputs": [
-    {
      "name": "video",
      "type": "VIDEO",
-     "link": 12
+     "links": []
     },
     {
-     "name": "filename_prefix",
+     "name": "filepath",
      "type": "STRING",
-     "link": null,
-     "widget": {
-      "name": "filename_prefix"
-     }
+     "links": []
     },
     {
-     "name": "format",
-     "type": "COMFY_DYNAMICCOMBO_V3",
-     "link": null,
-     "widget": {
-      "name": "format"
-     }
-    },
-    {
-     "name": "format.codec",
-     "type": "COMFY_DYNAMICCOMBO_V3",
-     "link": null,
-     "widget": {
-      "name": "format.codec"
-     }
-    },
-    {
-     "name": "codec",
-     "type": "COMFY_DYNAMICCOMBO_V3",
-     "link": null,
-     "shape": 7,
-     "widget": {
-      "name": "codec"
-     }
-    }
-   ],
-   "outputs": [
-    {
-     "name": "video",
-     "type": "VIDEO",
-     "links": [],
-     "slot_index": 0
+     "name": "report",
+     "type": "STRING",
+     "links": []
     }
    ],
    "properties": {
-    "Node name for S&R": "SaveVideo"
+    "Node name for S&R": "H3SaveVideo"
    },
    "widgets_values": [
-    "video/H3_upsampled",
+    24.0,
+    "off",
     "auto",
-    "auto",
-    "auto"
-   ],
-   "title": "SAVE"
+    "max",
+    "video/H3_upsampled"
+   ]
   }
  ],
  "links": [
@@ -606,14 +523,6 @@
    10,
    2,
    "FLOAT"
-  ],
-  [
-   12,
-   10,
-   0,
-   11,
-   0,
-   "VIDEO"
   ]
  ],
  "groups": [],

@@ -14,8 +14,7 @@ does the rest itself:
    re-draw either way, it only conditions it);
 3. encodes the prompt as Ref2VA conditioning with no references;
 4. runs the same upsampler the chain does -- latent upscale per chunk, one
-   light re-draw in tiles. A LoRA whose header makes it an h3upscale guide
-   LoRA gets its guide inside that same step, exactly as on the chain node;
+   light re-draw step in tiles: the original recipe, no LoRA;
 5. decodes, trims the padding off, and hands back the frames with the
    original soundtrack untouched.
 
@@ -121,8 +120,8 @@ class HTCVideoUpsampler:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": (
-                    "The H3 model for the re-draw. With an h3upscale LoRA, wire the plain "
-                    "UNETLoader output: the LoRA was trained on the bare DiT.")}),
+                    "The H3 model for the re-draw, e.g. the plain "
+                    "UNETLoader output.")}),
                 "clip": ("CLIP", {"tooltip": "The H3 text encoder, for the prompt."}),
                 "vae": ("VAE", {"tooltip": "The H3 video VAE."}),
                 "images": ("IMAGE", {"tooltip": (
@@ -130,23 +129,21 @@ class HTCVideoUpsampler:
                     "multiple of 32 px.")}),
                 "prompt": ("STRING", {
                     "default": _ug.CAPTION, "multiline": True,
-                    "tooltip": ("What the re-draw follows. The default is the caption the "
-                                "h3upscale LoRA was trained on; keep it with that LoRA.")}),
+                    "tooltip": ("What the re-draw follows. The default is a plain "
+                                "restore-detail caption.")}),
                 "upscale_model": (_tu.choices(), {
                     "tooltip": f"From models/{_tu.FOLDER}. The recipe uses {_tu.UPSCALER_FILE}."}),
                 "megapixels": ("FLOAT", {
                     "default": _tu.MEGAPIXELS, "min": 0.1, "max": 16.0, "step": 0.05,
                     "tooltip": "Output size as area, aspect kept (1 MP = 1024 x 1024)."}),
                 "denoise": ("FLOAT", {
-                    "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.005,
-                    "tooltip": ("Fraction of the schedule the two re-draw steps cover, as the "
-                                "chain's upsample_denoise. 0.1 is the setting that held; 0 only "
-                                "enlarges.")}),
+                    "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.005,
+                    "tooltip": ("As the chain's upsample_denoise. 0.2 is the original recipe "
+                                "(one step from sigma 0.75); 0 only enlarges.")}),
                 "lora": (["None"] + folder_paths.get_filename_list("loras"), {
                     "default": "None",
-                    "tooltip": ("A LoRA on the re-draw. An h3upscale LoRA (read off its header) "
-                                "also gets its guide: the clip at half the output size, so the "
-                                "re-draw restores the clip's own detail instead of inventing it.")}),
+                    "tooltip": ("Retired (10-25): ignored. The re-draw runs the original "
+                                "recipe with no LoRA. Kept only so saved graphs keep their slots.")}),
                 "lora_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
                 "tile_tokens": ("INT", {
                     "default": _tu.TOKEN_BUDGET, "min": 8192, "max": 1048576, "step": 1024,
@@ -168,8 +165,8 @@ class HTCVideoUpsampler:
     FUNCTION = "run"
     CATEGORY = "video/upscale"
     DESCRIPTION = (
-        "Upsamples a finished clip with the chain's upsampler: H3 latent upscale, then a "
-        "light two-step re-draw in tiles. An h3upscale LoRA gets its guide in those steps. "
+        "Upsamples a finished clip with the chain's upsampler: H3 latent upscale, then one "
+        "light re-draw step in tiles (the original recipe). "
         "tile_tokens lets a smaller card cut more tiles.")
 
     def run(self, model, clip, vae, images, prompt, upscale_model, megapixels, denoise,
@@ -220,6 +217,10 @@ class HTCVideoUpsampler:
             pass
 
         factor, guide = 0, None
+        if str(lora) != "None":
+            # Retired 10-25, as on the chain: the original recipe, no LoRA.
+            print(f"[{TAG}] lora is retired: {lora} is ignored", flush=True)
+            lora = "None"
         if str(lora) != "None" and float(lora_strength) != 0.0:
             path = folder_paths.get_full_path_or_raise("loras", str(lora))
             factor = _ug.lora_factor(path)
@@ -248,12 +249,13 @@ class HTCVideoUpsampler:
               f"tile budget {int(tile_tokens)} tokens"
               + (f"; guided by {lora} (factor {factor})" if guide is not None else
                  f"; re-draw LoRA {lora}" if str(lora) != "None" else ""), flush=True)
-        # The chain's re-draw, exactly as upsample_chain calls it.
-        steps = 2 if float(denoise) > 0.0 else _tu.STEPS
+        # The chain's re-draw, exactly as upsample_chain calls it unwired.
+        _cd = _tu.CHAIN_DEFAULTS
+        steps = int(_cd["steps"]) if float(denoise) > 0.0 else _tu.STEPS
         out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
                            float(megapixels), float(denoise), guide=guide,
                            budget=int(tile_tokens), steps=steps, start_sigma=0.0,
-                           overlap_px=192, detail_sigma=0.0)
+                           overlap_px=int(_cd["tile_overlap_px"]), detail_sigma=0.0)
         _tu._free(model)
         if _tu._device().type == "cuda":
             _tu._free_all_gpu()
