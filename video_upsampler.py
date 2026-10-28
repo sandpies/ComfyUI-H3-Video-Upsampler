@@ -166,6 +166,12 @@ class HTCVideoUpsampler:
                 "redraw_seed": ("INT", {
                     "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
                     "tooltip": "Noise seed for the Regen2K re-draw (default: 42)."}),
+                "regen2k_preset": (list(_tu.REGEN2K_PRESETS), {
+                    "default": "realistic",
+                    "tooltip": ("Regen2K sigma schedule preset: 'realistic' runs "
+                                "[0.909375, 6/7, 2/3, 0] (3 Euler steps); 'stylized' runs "
+                                "[0.6, 0.4, 0.2, 0.0] (3 Euler steps, lighter re-draw for "
+                                "2.5D/animated content to reduce new detail and character drift).")}),
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "The clip's soundtrack. Passed through untouched."}),
@@ -187,7 +193,7 @@ class HTCVideoUpsampler:
 
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
-            audio=None, audio_vae=None):
+            regen2k_preset="realistic", audio=None, audio_vae=None):
         import comfy.nested_tensor as nt
         import comfy.samplers
         import folder_paths
@@ -195,6 +201,8 @@ class HTCVideoUpsampler:
         from comfy_extras.nodes_minimax_h3 import temporal_shape
 
         _tu.register_folder()
+        r2k_sigmas = _tu.regen2k_sigmas_for_preset(regen2k_preset)
+        preset_name = str(regen2k_preset or "realistic").strip().lower()
         n = int(images.shape[0])
         if n < 1:
             raise ValueError(f"{TAG}: no frames")
@@ -246,9 +254,11 @@ class HTCVideoUpsampler:
                 pass
 
         sampler = comfy.samplers.sampler_object(str(sampler_name))
+        sig_list = [round(float(s), 4) for s in r2k_sigmas]
         print(f"[{TAG}] {n} frames at {int(images.shape[2])}x{int(images.shape[1])} -> H3 "
               f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}; "
-              f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag})", flush=True)
+              f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag}, "
+              f"preset={preset_name}, sigmas {sig_list})", flush=True)
         _cd = _tu.CHAIN_DEFAULTS
         overlap_px = int(_cd["tile_overlap_px"])
         if eff_strength <= 0.0:
@@ -258,13 +268,13 @@ class HTCVideoUpsampler:
                                budget=int(tile_tokens), steps=1, start_sigma=0.0,
                                overlap_px=overlap_px, detail_sigma=0.0)
         else:
-            steps = len(_tu.REGEN2K_SIGMAS) - 1
+            steps = len(r2k_sigmas) - 1
             out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
                                float(megapixels), 1.0, guide=None,
                                budget=int(tile_tokens), steps=steps, start_sigma=0.0,
                                overlap_px=overlap_px, detail_sigma=0.0,
                                seed=int(redraw_seed), noise="per_chunk",
-                               sigmas=_tu.REGEN2K_SIGMAS)
+                               sigmas=r2k_sigmas)
         _tu._free(model)
         if _tu._device().type == "cuda":
             _tu._free_all_gpu()
@@ -272,7 +282,7 @@ class HTCVideoUpsampler:
         del out
         report = (f"{n} frames {int(images.shape[2])}x{int(images.shape[1])} -> "
                   f"{int(img.shape[2])}x{int(img.shape[1])}"
-                  f", regen2k ({lora_tag}, {steps} steps)"
+                  f", regen2k ({lora_tag}, preset={preset_name}, {steps} steps)"
                   f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
         print(f"[{TAG}] {report}", flush=True)
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),

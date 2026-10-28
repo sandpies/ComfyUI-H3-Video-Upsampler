@@ -75,7 +75,20 @@ _DEFAULT_CHUNK_FRAMES = _DefaultInt(CHUNK_FRAMES)
 REGEN2K_MIN_CHUNK_FRAMES = 68
 REGEN2K_SEED = 42
 REGEN2K_SIGMAS = torch.tensor([0.909375, 6.0 / 7.0, 2.0 / 3.0, 0.0], dtype=torch.float32)
+REGEN2K_SIGMAS_STYLIZED = torch.tensor([0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
 REGEN2K_SIGMAS_2STEP = torch.tensor([0.7, 0.494118, 0.0], dtype=torch.float32)
+REGEN2K_PRESETS = ("realistic", "stylized")
+
+
+def regen2k_sigmas_for_preset(preset="realistic"):
+    """Return the 4-sigma Regen2K schedule tensor for `preset`."""
+    p = str(preset or "realistic").strip().lower()
+    if p == "realistic":
+        return REGEN2K_SIGMAS
+    if p == "stylized":
+        return REGEN2K_SIGMAS_STYLIZED
+    raise ValueError(f"{TAG}: unknown regen2k_preset {preset!r} "
+                     f"(expected one of {list(REGEN2K_PRESETS)})")
 
 # --- the guided re-draw (not part of the recipe) ----------------------------
 #
@@ -1045,10 +1058,19 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                                      dev)[None, None, None]))
         tokens = (seq_len(grid[2], grid[3], t) if int(factor) <= 1
                   else f"{guided_seq_len(grid[2], grid[3], t, factor)} (guide incl.)")
+        _sig_s = [round(float(s), 4) for s in sigmas]
+        _sig_cpu = sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor) else torch.tensor(list(sigmas), dtype=torch.float32)
+        _preset_tag = ("stylized" if _sig_cpu.shape == REGEN2K_SIGMAS_STYLIZED.shape
+                       and torch.allclose(_sig_cpu, REGEN2K_SIGMAS_STYLIZED)
+                       else "realistic" if _sig_cpu.shape == REGEN2K_SIGMAS.shape
+                       and torch.allclose(_sig_cpu, REGEN2K_SIGMAS)
+                       else None)
         print(f"[{TAG}] chunk {w * SPATIAL}x{h * SPATIAL}px x {t} latent steps: "
               f"{grid[0]}x{grid[1]} tiles of {grid[2]}x{grid[3]}px, overlap "
               f"{grid[4]}/{grid[5]}px, {tokens} tokens per "
               f"forward, stepped together"
+              + (f", preset={_preset_tag}" if _preset_tag else "")
+              + f", sigmas {_sig_s}"
               + (f", high-pass detail={float(detail_sigma):g}" if float(detail_sigma or 0.0) > 0.0 else ""),
               flush=True)
 
