@@ -1,8 +1,8 @@
 {
  "id": "h3-video-upsampler",
  "revision": 0,
- "last_node_id": 11,
- "last_link_id": 12,
+ "last_node_id": 9,
+ "last_link_id": 10,
  "nodes": [
   {
    "id": 1,
@@ -24,7 +24,7 @@
     "Node name for S&R": "MarkdownNote"
    },
    "widgets_values": [
-    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip (put it in `ComfyUI/input`). Any size; 24 fps is what H3\n   assumes, other rates work but the soundtrack conditions the re-draw loosely.\n2. **Queue.** H3 Save Video writes it to `video/H3_upsampled` at the clip's own fps,\n   with its own soundtrack untouched (NVENC when there is a GPU). Set its `frame_gen` to x2 for\n   double the frame rate (RTX GPU + `nvidia-vfx`).\n\n### The node\n- **megapixels**: output size, aspect kept (2 = about 1920x1080).\n- **denoise**: as the chain's upsample_denoise. 0.2 is the original recipe (one re-draw step from sigma 0.75); 0 only enlarges.\n- **lora**: retired and ignored. The re-draw runs the original recipe with no LoRA.\n- **tile_tokens**: VRAM. Lower = more, smaller tiles, slower, less memory. 70000 is the\n  recipe; try 40000 or 25000 on a smaller card.\n- **audio_vae** wired = the re-draw hears the soundtrack; unwired = it hears silence.\n\nMouths and motion come from the clip; only fine detail is re-drawn."
+    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip (put it in `ComfyUI/input`). Any size; 24 fps is what H3\n   assumes, other rates work but the soundtrack conditions the re-draw loosely.\n2. **Queue.** H3 Save Video writes it to `video/H3_upsampled` at the clip's own fps,\n   with its own soundtrack untouched (NVENC when there is a GPU). Set its `frame_gen` to x2 for\n   double the frame rate (RTX GPU + `nvidia-vfx`).\n\n### The node\n- **megapixels**: output size, aspect kept (2 = about 1920x1080).\n- **denoise**: Regen2K LoRA strength for the 3-step Euler re-draw on `[0.909375, 6/7, 2/3, 0]` (0.25 is the default; 0 skips the re-draw and only enlarges).\n- **lora**: the Open-H3-Regenerate-2K LoRA (`open_h3_regen2k_refiner_r256pp_bf16.safetensors` by default).\n- **tile_tokens**: VRAM. Lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on a smaller card.\n- **redraw_seed**: noise seed for the Regen2K re-draw (42 by default).\n- **audio_vae** wired = the re-draw pins the real soundtrack; unwired = it pins silence.\n\nMouths and motion come from the clip; only fine detail is re-drawn."
    ]
   },
   {
@@ -56,21 +56,21 @@
     "Node name for S&R": "UNETLoader"
    },
    "widgets_values": [
-    "minimax_h3_ref2va_int8_convrot.safetensors",
+    "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
     "default"
    ],
    "title": "Load Diffusion Model (plain, no LoRAs)"
   },
   {
    "id": 3,
-   "type": "CLIPLoader",
+   "type": "VAELoader",
    "pos": [
     -900,
-    130
+    140
    ],
    "size": [
     420,
-    106
+    58
    ],
    "flags": {},
    "order": 2,
@@ -78,8 +78,8 @@
    "inputs": [],
    "outputs": [
     {
-     "name": "CLIP",
-     "type": "CLIP",
+     "name": "VAE",
+     "type": "VAE",
      "links": [
       3
      ],
@@ -87,12 +87,10 @@
     }
    ],
    "properties": {
-    "Node name for S&R": "CLIPLoader"
+    "Node name for S&R": "VAELoader"
    },
    "widgets_values": [
-    "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
-    "minimax",
-    "default"
+    "minimax_h3_video_vae_int8_convrot.safetensors"
    ]
   },
   {
@@ -100,7 +98,7 @@
    "type": "VAELoader",
    "pos": [
     -900,
-    280
+    240
    ],
    "size": [
     420,
@@ -115,39 +113,7 @@
      "name": "VAE",
      "type": "VAE",
      "links": [
-      4
-     ],
-     "slot_index": 0
-    }
-   ],
-   "properties": {
-    "Node name for S&R": "VAELoader"
-   },
-   "widgets_values": [
-    "minimax_h3_video_vae_int8_convrot.safetensors"
-   ]
-  },
-  {
-   "id": 5,
-   "type": "VAELoader",
-   "pos": [
-    -900,
-    380
-   ],
-   "size": [
-    420,
-    58
-   ],
-   "flags": {},
-   "order": 4,
-   "mode": 0,
-   "inputs": [],
-   "outputs": [
-    {
-     "name": "VAE",
-     "type": "VAE",
-     "links": [
-      7
+      6
      ],
      "slot_index": 0
     }
@@ -161,7 +127,7 @@
    "title": "Load VAE (audio)"
   },
   {
-   "id": 6,
+   "id": 5,
    "type": "LoadVideo",
    "pos": [
     -420,
@@ -172,7 +138,7 @@
     420
    ],
    "flags": {},
-   "order": 5,
+   "order": 4,
    "mode": 0,
    "inputs": [],
    "outputs": [
@@ -195,7 +161,7 @@
    "title": "clip to upscale"
   },
   {
-   "id": 7,
+   "id": 6,
    "type": "GetVideoComponents",
    "pos": [
     -420,
@@ -206,7 +172,7 @@
     140
    ],
    "flags": {},
-   "order": 6,
+   "order": 5,
    "mode": 0,
    "inputs": [
     {
@@ -220,7 +186,7 @@
      "name": "images",
      "type": "IMAGE",
      "links": [
-      5
+      4
      ],
      "slot_index": 0
     },
@@ -228,7 +194,7 @@
      "name": "audio",
      "type": "AUDIO",
      "links": [
-      6
+      5
      ],
      "slot_index": 1
     },
@@ -236,7 +202,7 @@
      "name": "fps",
      "type": "FLOAT",
      "links": [
-      11
+      10
      ],
      "slot_index": 2
     },
@@ -258,7 +224,7 @@
    }
   },
   {
-   "id": 8,
+   "id": 7,
    "type": "H3VideoUpsampler",
    "pos": [
     -60,
@@ -266,10 +232,10 @@
    ],
    "size": [
     420,
-    520
+    320
    ],
    "flags": {},
-   "order": 7,
+   "order": 6,
    "mode": 0,
    "inputs": [
     {
@@ -278,30 +244,25 @@
      "link": 2
     },
     {
-     "name": "clip",
-     "type": "CLIP",
-     "link": 3
-    },
-    {
      "name": "vae",
      "type": "VAE",
-     "link": 4
+     "link": 3
     },
     {
      "name": "images",
      "type": "IMAGE",
-     "link": 5
+     "link": 4
     },
     {
      "name": "audio",
      "type": "AUDIO",
-     "link": 6,
+     "link": 5,
      "shape": 7
     },
     {
      "name": "audio_vae",
      "type": "VAE",
-     "link": 7,
+     "link": 6,
      "shape": 7
     }
    ],
@@ -310,7 +271,7 @@
      "name": "images",
      "type": "IMAGE",
      "links": [
-      9
+      8
      ],
      "slot_index": 0
     },
@@ -318,7 +279,7 @@
      "name": "audio",
      "type": "AUDIO",
      "links": [
-      10
+      9
      ],
      "slot_index": 1
     },
@@ -326,7 +287,7 @@
      "name": "report",
      "type": "STRING",
      "links": [
-      8
+      7
      ],
      "slot_index": 2
     }
@@ -335,35 +296,34 @@
     "Node name for S&R": "H3VideoUpsampler"
    },
    "widgets_values": [
-    "h3upscale, increase resolution and restore fine details while preserving the original content and visual style.",
     "minimax_h3_latent_upscaler_3d_bf16.safetensors",
     2.0,
-    0.2,
-    "None",
-    1.0,
+    0.25,
+    "open_h3_regen2k_refiner_r256pp_bf16.safetensors",
     70000,
-    "euler"
+    "euler",
+    42
    ]
   },
   {
-   "id": 9,
+   "id": 8,
    "type": "PreviewAny",
    "pos": [
     -60,
-    0
+    -180
    ],
    "size": [
     420,
     120
    ],
    "flags": {},
-   "order": 8,
+   "order": 7,
    "mode": 0,
    "inputs": [
     {
      "name": "source",
      "type": "*",
-     "link": 8
+     "link": 7
     }
    ],
    "outputs": [],
@@ -373,7 +333,7 @@
    "title": "report"
   },
   {
-   "id": 10,
+   "id": 9,
    "type": "H3SaveVideo",
    "pos": [
     420,
@@ -384,43 +344,46 @@
     300
    ],
    "flags": {},
-   "order": 9,
+   "order": 8,
    "mode": 0,
    "inputs": [
     {
      "name": "images",
      "type": "IMAGE",
-     "link": 9
+     "link": 8
     },
     {
      "name": "audio",
      "type": "AUDIO",
-     "link": 10
+     "link": 9
     },
     {
      "name": "fps",
      "type": "FLOAT",
+     "link": 10,
      "widget": {
       "name": "fps"
-     },
-     "link": 11
+     }
     }
    ],
    "outputs": [
     {
      "name": "video",
      "type": "VIDEO",
-     "links": []
+     "links": [],
+     "slot_index": 0
     },
     {
      "name": "filepath",
      "type": "STRING",
-     "links": []
+     "links": [],
+     "slot_index": 1
     },
     {
      "name": "report",
      "type": "STRING",
-     "links": []
+     "links": [],
+     "slot_index": 2
     }
    ],
    "properties": {
@@ -438,9 +401,9 @@
  "links": [
   [
    1,
-   6,
+   5,
    0,
-   7,
+   6,
    0,
    "VIDEO"
   ],
@@ -448,7 +411,7 @@
    2,
    2,
    0,
-   8,
+   7,
    0,
    "MODEL"
   ],
@@ -456,71 +419,63 @@
    3,
    3,
    0,
-   8,
+   7,
    1,
-   "CLIP"
-  ],
-  [
-   4,
-   4,
-   0,
-   8,
-   2,
    "VAE"
   ],
   [
-   5,
-   7,
+   4,
+   6,
    0,
-   8,
-   3,
+   7,
+   2,
    "IMAGE"
   ],
   [
+   5,
    6,
-   7,
    1,
-   8,
-   4,
+   7,
+   3,
    "AUDIO"
   ],
   [
-   7,
-   5,
+   6,
+   4,
    0,
-   8,
-   5,
+   7,
+   4,
    "VAE"
   ],
   [
-   8,
-   8,
+   7,
+   7,
    2,
-   9,
+   8,
    0,
    "STRING"
   ],
   [
-   9,
    8,
+   7,
    0,
-   10,
+   9,
    0,
    "IMAGE"
   ],
   [
-   10,
-   8,
+   9,
+   7,
    1,
-   10,
+   9,
    1,
    "AUDIO"
   ],
   [
-   11,
-   7,
-   2,
    10,
+   6,
+   2,
+   9,
    2,
    "FLOAT"
   ]

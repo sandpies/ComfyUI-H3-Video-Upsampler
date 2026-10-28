@@ -23,6 +23,12 @@ denoise 0.2 -- is the one the user proved in bbaudio-2025's
 No code was copied from it; the checker compares the two end to end when that
 pack is installed and requires identical latents.
 
+## Open-H3-Regenerate-2K (`redraw=regen2k`)
+
+The 3-step Regenerate-2K schedule (`[0.909375, 6/7, 2/3, 0]`) and refiner LoRA are
+from NVlabs' [Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+(Apache-2.0) and [Kijai/MiniMax-H3-experimental](https://huggingface.co/Kijai/MiniMax-H3-experimental).
+
 ## `upscale_guide.py` -- the h3upscale guide layout
 
 The guide geometry (`target_crop_v2` / `target_grid_stride_v1`: the source

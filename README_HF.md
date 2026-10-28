@@ -25,21 +25,23 @@ whole chain. Mouths, motion and the soundtrack come from your clip. **H3 Save Vi
 1. Clone into `ComfyUI/custom_nodes` and restart ComfyUI.
 2. Put the latent upscaler `minimax_h3_latent_upscaler_3d_bf16.safetensors` in
    `ComfyUI/models/latent_upscale_models`
-   ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)).
+   ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler))
+   and the Regen2K refiner LoRA `open_h3_regen2k_refiner_r256pp_bf16.safetensors`
+   in `ComfyUI/models/loras`.
 3. Load `example_workflows/H3_Video_Upsampler.json`, pick a clip, queue.
 
 Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
-`minimax_h3_ref2va_int8_convrot` DiT, text encoder, video and audio VAE). No LoRA.
+`minimax_h3_fl2va_pruned_int8_convrot` DiT, video and audio VAE).
 
 ## The node: H3 Video Upsampler
 
 | widget | what it does |
 |---|---|
 | `megapixels` | output size, aspect kept (2 = about 1920x1080) |
-| `denoise` | **0.2** is the original recipe (one re-draw step from sigma 0.75); 0 only enlarges |
-| `lora` | retired and ignored (kept so saved graphs load): the h3upscale guide cost fine detail and drew tile grids against the plain recipe |
-| `tile_tokens` | **VRAM.** Largest sequence per tile; lower = more, smaller tiles, slower, less memory. 70000 is the recipe; try 40000 or 25000 on smaller cards |
-| `prompt` | what the re-draw follows; the default is a plain restore-detail caption |
+| `denoise` | **0.25** is the default Regen2K LoRA strength (3 Euler steps on `[0.909375, 6/7, 2/3, 0]`); 0 skips the re-draw and only enlarges |
+| `lora` | Open-H3-Regenerate-2K LoRA from `models/loras` (`open_h3_regen2k_refiner_r256pp_bf16.safetensors` by default) |
+| `tile_tokens` | **VRAM.** Largest sequence per tile; lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
+| `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |
 
 The recipe: 102-frame chunks sharing 17, anchor 0.999, 70000-token tiles with
 128 px overlap, seed 444.
@@ -77,5 +79,6 @@ with no LoRA. The file stays on Hugging Face under `lora/` for reference.
 
 Built in [ComfyUI-Hand-Tie-Clips](https://github.com/sandpies/ComfyUI-Hand-Tie-Clips), where the same upsampler runs over a
 whole chain. Latent upscaler network: LBH-123-AI. Upscale recipe: bbaudio-2025's
-MMH3 Ultimate Upscale. Guide layout and dataset of the retired LoRA: Alissonerdx.
-See `THIRD_PARTY_NOTICES.md`.
+MMH3 Ultimate Upscale. Open-H3-Regenerate-2K refiner and 3-step schedule: NVlabs
+(`Efficient-Large-Model/Open-H3-Regenerate-2K`) and Kijai. Guide layout and
+dataset of the retired LoRA: Alissonerdx. See `THIRD_PARTY_NOTICES.md`.

@@ -12,9 +12,9 @@ does the rest itself:
 2. encodes them with the video VAE, and the soundtrack with the audio VAE when
    both are wired (otherwise a silent stream: the audio is frozen in the
    re-draw either way, it only conditions it);
-3. encodes the prompt as Ref2VA conditioning with no references;
-4. runs the same upsampler the chain does -- latent upscale per chunk, one
-   light re-draw step in tiles: the original recipe, no LoRA;
+3. builds zeroed-out conditioning (no prompt, no references);
+4. runs the same Open-H3-Regenerate-2K upsampler the chain does -- 3D latent
+   upscale per chunk, then 3 Euler steps in tiles (noise="per_chunk", seed 42);
 5. decodes, trims the padding off, and hands back the frames with the
    original soundtrack untouched.
 
@@ -35,6 +35,18 @@ from . import upscale_guide as _ug
 TAG = "H3VideoUpsampler"
 GRID_PX = 32                # H3 canvases are multiples of 32 on both edges
 H3_FPS = 24                 # what H3's audio grid assumes per video frame
+REGEN2K_DEFAULT_LORA = "open_h3_regen2k_refiner_r256pp_bf16.safetensors"
+REGEN2K_DEFAULT_STRENGTH = 0.25
+REGEN2K_SEED = 42
+REGEN2K_TEXT_DIM = 5120
+
+
+def zero_out_cond():
+    """Zeroed-out 1-token conditioning (equivalent to ConditioningZeroOut on an
+    empty text encode), with no prompt and no references."""
+    return [[torch.zeros((1, 1, REGEN2K_TEXT_DIM), dtype=torch.float32),
+             {"pooled_output": None,
+              "minimax_token_tags": torch.ones(1, dtype=torch.long)}]]
 
 
 def valid_length(n):
@@ -117,46 +129,49 @@ class HTCVideoUpsampler:
     def INPUT_TYPES(cls):
         import comfy.samplers
         import folder_paths
+        loras = [c for c in folder_paths.get_filename_list("loras") if c != "None"]
+        if REGEN2K_DEFAULT_LORA not in loras:
+            loras = [REGEN2K_DEFAULT_LORA] + loras
+        loras.append("None")
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": (
-                    "The H3 model for the re-draw, e.g. the plain "
-                    "UNETLoader output.")}),
-                "clip": ("CLIP", {"tooltip": "The H3 text encoder, for the prompt."}),
+                    "The H3 model for the re-draw: wire UNETLoader with "
+                    "minimax_h3_fl2va_pruned_int8_convrot.safetensors.")}),
                 "vae": ("VAE", {"tooltip": "The H3 video VAE."}),
                 "images": ("IMAGE", {"tooltip": (
                     "The clip's frames (Get Video Components). Any size; fitted to a "
                     "multiple of 32 px.")}),
-                "prompt": ("STRING", {
-                    "default": _ug.CAPTION, "multiline": True,
-                    "tooltip": ("What the re-draw follows. The default is a plain "
-                                "restore-detail caption.")}),
                 "upscale_model": (_tu.choices(), {
-                    "tooltip": f"From models/{_tu.FOLDER}. The recipe uses {_tu.UPSCALER_FILE}."}),
+                    "tooltip": f"From models/{_tu.FOLDER}. Uses {_tu.UPSCALER_FILE}."}),
                 "megapixels": ("FLOAT", {
                     "default": _tu.MEGAPIXELS, "min": 0.1, "max": 16.0, "step": 0.05,
                     "tooltip": "Output size as area, aspect kept (1 MP = 1024 x 1024)."}),
                 "denoise": ("FLOAT", {
-                    "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.005,
-                    "tooltip": ("As the chain's upsample_denoise. 0.2 is the original recipe "
-                                "(one step from sigma 0.75); 0 only enlarges.")}),
-                "lora": (["None"] + folder_paths.get_filename_list("loras"), {
-                    "default": "None",
-                    "tooltip": ("Retired (10-25): ignored. The re-draw runs the original "
-                                "recipe with no LoRA. Kept only so saved graphs keep their slots.")}),
-                "lora_strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
+                    "default": REGEN2K_DEFAULT_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.005,
+                    "tooltip": ("Regen2K LoRA strength for the 3-step Euler re-draw "
+                                "(0.25 is the default; 0 skips the re-draw and only enlarges).")}),
+                "lora": (loras, {
+                    "default": REGEN2K_DEFAULT_LORA,
+                    "tooltip": ("Open-H3-Regenerate-2K LoRA from models/loras "
+                                f"(default: {REGEN2K_DEFAULT_LORA}).")}),
                 "tile_tokens": ("INT", {
                     "default": _tu.TOKEN_BUDGET, "min": 8192, "max": 1048576, "step": 1024,
-                    "tooltip": ("Largest sequence one tile forward may carry. Lower = more, "
-                                "smaller tiles: less VRAM, slower. "
-                                f"{_tu.TOKEN_BUDGET} is the recipe's value.")}),
+                    "tooltip": ("Largest sequence one tile forward may carry. Lower = shorter "
+                                "chunks (down to 68 f) then more, smaller tiles: less VRAM, "
+                                f"slower. {_tu.TOKEN_BUDGET} is the default.")}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                # Not named seed: ComfyUI hangs a randomize control on any
+                # widget called seed, and the default 42 should stay fixed.
+                "redraw_seed": ("INT", {
+                    "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
+                    "tooltip": "Noise seed for the Regen2K re-draw (default: 42)."}),
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "The clip's soundtrack. Passed through untouched."}),
                 "audio_vae": ("VAE", {"tooltip": (
-                    "The H3 audio VAE. With it, the re-draw is conditioned on the real "
-                    "soundtrack (best at 24 fps); without it, on silence.")}),
+                    "The H3 audio VAE. With it, the re-draw pins the real "
+                    "soundtrack (best at 24 fps); without it, silence.")}),
             },
         }
 
@@ -165,17 +180,19 @@ class HTCVideoUpsampler:
     FUNCTION = "run"
     CATEGORY = "video/upscale"
     DESCRIPTION = (
-        "Upsamples a finished clip with the chain's upsampler: H3 latent upscale, then one "
-        "light re-draw step in tiles (the original recipe). "
-        "tile_tokens lets a smaller card cut more tiles.")
+        "Upsamples a finished clip with Open-H3-Regenerate-2K: H3 3D latent upscale, then "
+        "3 Euler steps on [0.909375, 6/7, 2/3, 0] with zeroed-out conditioning and the "
+        "soundtrack pinned clean (noise=per_chunk, seed 42). tile_tokens lets a smaller card "
+        "shorten chunks or cut more tiles.")
 
-    def run(self, model, clip, vae, images, prompt, upscale_model, megapixels, denoise,
-            lora, lora_strength, tile_tokens, sampler_name, audio=None, audio_vae=None):
+    def run(self, model, vae, images, upscale_model, megapixels, denoise,
+            lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
+            audio=None, audio_vae=None):
         import comfy.nested_tensor as nt
         import comfy.samplers
         import folder_paths
         import nodes
-        from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo, temporal_shape
+        from comfy_extras.nodes_minimax_h3 import temporal_shape
 
         _tu.register_folder()
         n = int(images.shape[0])
@@ -204,28 +221,21 @@ class HTCVideoUpsampler:
             audio_note = "conditioned on silence (no audio_vae + audio)"
         latent = {"samples": nt.NestedTensor((video, a_lat.to(video.device, video.dtype)))}
 
-        got = MiniMaxH3ReferenceToVideo.execute(
-            clip=clip, prompt=str(prompt), width=w, height=h, length=length,
-            ref_image_size="match")
-        cond = (got.args if hasattr(got, "args") else tuple(got))[0]
-        try:
-            import comfy.model_management as _mm
-            if hasattr(clip, "patcher") and hasattr(clip.patcher, "model"):
-                clip.patcher.model.to(_mm.text_encoder_offload_device())
-                _mm.soft_empty_cache()
-        except Exception:
-            pass
-
-        factor, guide = 0, None
-        if str(lora) != "None":
-            # Retired 10-25, as on the chain: the original recipe, no LoRA.
-            print(f"[{TAG}] lora is retired: {lora} is ignored", flush=True)
-            lora = "None"
-        if str(lora) != "None" and float(lora_strength) != 0.0:
-            path = folder_paths.get_full_path_or_raise("loras", str(lora))
-            factor = _ug.lora_factor(path)
+        cond = zero_out_cond()
+        model = model.clone() if hasattr(model, "clone") else model
+        eff_lora = str(lora or "").strip()
+        if not eff_lora or eff_lora == "None":
+            eff_lora = None if getattr(model, "patches", None) else REGEN2K_DEFAULT_LORA
+        eff_strength = float(denoise)
+        if eff_strength <= 0.0:
+            lora_tag = "denoise 0 (3D upscale only)"
+        elif eff_lora is None:
+            lora_tag = f"pre-patched ({len(model.patches)} targets)"
+        else:
+            folder_paths.get_full_path_or_raise("loras", eff_lora)
             model = nodes.LoraLoaderModelOnly().load_lora_model_only(
-                model, str(lora), float(lora_strength))[0]
+                model, eff_lora, eff_strength)[0]
+            lora_tag = f"{eff_lora} @ {eff_strength:g}"
         # As upsample_chain: port dense LoRA AdaLN patches (pruned DiTs).
         fix = getattr(nodes, "NODE_CLASS_MAPPINGS", {}).get("H3AdaLNLoRAFix")
         if fix is not None and hasattr(model, "patches"):
@@ -234,28 +244,27 @@ class HTCVideoUpsampler:
                 model = (res.args if hasattr(res, "args") else tuple(res))[0]
             except Exception:
                 pass
-        if factor and float(denoise) > 0.0:
-            _ug.install()
-
-            def decode(v):
-                img = vae.decode(v)
-                return img.reshape(-1, img.shape[-3], img.shape[-2], img.shape[-1])
-            guide = _tu.Guide(factor=factor, cond=cond, decode=decode,
-                              encode=vae.encode, pixels=_ug.guide_pixels)
 
         sampler = comfy.samplers.sampler_object(str(sampler_name))
         print(f"[{TAG}] {n} frames at {int(images.shape[2])}x{int(images.shape[1])} -> H3 "
               f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}; "
-              f"tile budget {int(tile_tokens)} tokens"
-              + (f"; guided by {lora} (factor {factor})" if guide is not None else
-                 f"; re-draw LoRA {lora}" if str(lora) != "None" else ""), flush=True)
-        # The chain's re-draw, exactly as upsample_chain calls it unwired.
+              f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag})", flush=True)
         _cd = _tu.CHAIN_DEFAULTS
-        steps = int(_cd["steps"]) if float(denoise) > 0.0 else _tu.STEPS
-        out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
-                           float(megapixels), float(denoise), guide=guide,
-                           budget=int(tile_tokens), steps=steps, start_sigma=0.0,
-                           overlap_px=int(_cd["tile_overlap_px"]), detail_sigma=0.0)
+        overlap_px = int(_cd["tile_overlap_px"])
+        if eff_strength <= 0.0:
+            steps = 0
+            out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
+                               float(megapixels), 0.0, guide=None,
+                               budget=int(tile_tokens), steps=1, start_sigma=0.0,
+                               overlap_px=overlap_px, detail_sigma=0.0)
+        else:
+            steps = len(_tu.REGEN2K_SIGMAS) - 1
+            out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
+                               float(megapixels), 1.0, guide=None,
+                               budget=int(tile_tokens), steps=steps, start_sigma=0.0,
+                               overlap_px=overlap_px, detail_sigma=0.0,
+                               seed=int(redraw_seed), noise="per_chunk",
+                               sigmas=_tu.REGEN2K_SIGMAS)
         _tu._free(model)
         if _tu._device().type == "cuda":
             _tu._free_all_gpu()
@@ -263,9 +272,8 @@ class HTCVideoUpsampler:
         del out
         report = (f"{n} frames {int(images.shape[2])}x{int(images.shape[1])} -> "
                   f"{int(img.shape[2])}x{int(img.shape[1])}"
-                  + (f", guided ({lora})" if guide is not None else "")
-                  + f", {steps} step(s) at denoise {float(denoise):g}"
-                  + f", tile budget {int(tile_tokens)}, overlap 192px")
+                  f", regen2k ({lora_tag}, {steps} steps)"
+                  f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
         print(f"[{TAG}] {report}", flush=True)
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
                 report)
