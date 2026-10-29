@@ -202,6 +202,15 @@ class HTCVideoUpsampler:
         from comfy_extras.nodes_minimax_h3 import temporal_shape
 
         _tu.register_folder()
+        _fsm = getattr(vae, "first_stage_model", None)
+        if (_fsm is not None and type(_fsm).__name__ == "MiniMaxH3VideoVAE"
+                and not hasattr(_fsm, "decoder")):
+            raise RuntimeError(
+                f"{TAG}: the wired Video VAE has no decoder (encoder-only, 343 MB — "
+                "e.g. minimax_h3_sol_vae_fp16.safetensors uses decoder.blocks.* keys "
+                "which ComfyUI's stock VAELoader skips). Pick "
+                "minimax_h3_lynnreal_light_vae_int8_convrot.safetensors or "
+                "minimax_h3_video_vae_int8_convrot.safetensors in VAELoader.")
         r2k_sigmas = _tu.regen2k_sigmas_for_preset(regen2k_preset)
         preset_name = str(regen2k_preset or "realistic").strip().lower()
         n = int(images.shape[0])
