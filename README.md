@@ -26,7 +26,7 @@ Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 | widget | what it does |
 |---|---|
 | `megapixels` | output size, aspect kept (2 = about 1920x1080) |
-| `denoise` | **0.25** is the default Regen2K LoRA strength (3 Euler steps on `[0.8, 24/35, 0.48, 0]`); 0 skips the re-draw and only enlarges |
+| `denoise` | **0.8** is the default Regen2K LoRA strength (3 Euler steps on `[0.8, 24/35, 0.48, 0]`); 0 skips the re-draw and only enlarges |
 | `lora` | Open-H3-Regenerate-2K LoRA from `models/loras` (`open_h3_regenerate_2k_r256pp_bf16.safetensors` by default) |
 | `tile_tokens` | **VRAM.** Largest sequence per tile; lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
 | `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |

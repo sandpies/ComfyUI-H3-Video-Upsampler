@@ -36,7 +36,7 @@ TAG = "H3VideoUpsampler"
 GRID_PX = 32                # H3 canvases are multiples of 32 on both edges
 H3_FPS = 24                 # what H3's audio grid assumes per video frame
 REGEN2K_DEFAULT_LORA = "open_h3_regenerate_2k_r256pp_bf16.safetensors"
-REGEN2K_DEFAULT_STRENGTH = 0.25
+REGEN2K_DEFAULT_STRENGTH = 0.8
 REGEN2K_SEED = 42
 REGEN2K_TEXT_DIM = 5120
 
@@ -150,7 +150,7 @@ class HTCVideoUpsampler:
                 "denoise": ("FLOAT", {
                     "default": REGEN2K_DEFAULT_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.005,
                     "tooltip": ("Regen2K LoRA strength for the 3-step Euler re-draw "
-                                "(0.25 is the default; 0 skips the re-draw and only enlarges).")}),
+                                "(0.8 is the default; 0 skips the re-draw and only enlarges).")}),
                 "lora": (loras, {
                     "default": REGEN2K_DEFAULT_LORA,
                     "tooltip": ("Open-H3-Regenerate-2K LoRA from models/loras "
