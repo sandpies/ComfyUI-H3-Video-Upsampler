@@ -35,7 +35,7 @@ from . import upscale_guide as _ug
 TAG = "H3VideoUpsampler"
 GRID_PX = 32                # H3 canvases are multiples of 32 on both edges
 H3_FPS = 24                 # what H3's audio grid assumes per video frame
-REGEN2K_DEFAULT_LORA = "open_h3_regen2k_refiner_r256pp_bf16.safetensors"
+REGEN2K_DEFAULT_LORA = "open_h3_regenerate_2k_r256pp_bf16.safetensors"
 REGEN2K_DEFAULT_STRENGTH = 0.25
 REGEN2K_SEED = 42
 REGEN2K_TEXT_DIM = 5120

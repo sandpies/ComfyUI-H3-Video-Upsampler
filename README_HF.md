@@ -26,7 +26,7 @@ whole chain. Mouths, motion and the soundtrack come from your clip. **H3 Save Vi
 2. Put the latent upscaler `minimax_h3_latent_upscaler_3d_bf16.safetensors` in
    `ComfyUI/models/latent_upscale_models`
    ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler))
-   and the Regen2K refiner LoRA `open_h3_regen2k_refiner_r256pp_bf16.safetensors`
+   and the Regen2K LoRA `open_h3_regenerate_2k_r256pp_bf16.safetensors`
    in `ComfyUI/models/loras`.
 3. Load `example_workflows/H3_Video_Upsampler.json`, pick a clip, queue.
 
@@ -39,7 +39,7 @@ Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 |---|---|
 | `megapixels` | output size, aspect kept (2 = about 1920x1080) |
 | `denoise` | **0.25** is the default Regen2K LoRA strength (3 Euler steps on `[0.8, 24/35, 0.48, 0]`); 0 skips the re-draw and only enlarges |
-| `lora` | Open-H3-Regenerate-2K LoRA from `models/loras` (`open_h3_regen2k_refiner_r256pp_bf16.safetensors` by default) |
+| `lora` | Open-H3-Regenerate-2K LoRA from `models/loras` (`open_h3_regenerate_2k_r256pp_bf16.safetensors` by default) |
 | `tile_tokens` | **VRAM.** Largest sequence per tile; lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
 | `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |
 
