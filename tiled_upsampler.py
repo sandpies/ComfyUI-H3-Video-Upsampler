@@ -75,9 +75,10 @@ _DEFAULT_CHUNK_FRAMES = _DefaultInt(CHUNK_FRAMES)
 REGEN2K_MIN_CHUNK_FRAMES = 68
 REGEN2K_SEED = 42
 REGEN2K_SIGMAS = torch.tensor([0.909375, 6.0 / 7.0, 2.0 / 3.0, 0.0], dtype=torch.float32)
+REGEN2K_SIGMAS_START_08 = torch.tensor([0.8, 24.0 / 35.0, 0.48, 0.0], dtype=torch.float32)
 REGEN2K_SIGMAS_STYLIZED = torch.tensor([0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
 REGEN2K_SIGMAS_2STEP = torch.tensor([0.7, 0.494118, 0.0], dtype=torch.float32)
-REGEN2K_PRESETS = ("realistic", "stylized")
+REGEN2K_PRESETS = ("realistic", "start_08", "stylized")
 
 
 def regen2k_sigmas_for_preset(preset="realistic"):
@@ -85,6 +86,8 @@ def regen2k_sigmas_for_preset(preset="realistic"):
     p = str(preset or "realistic").strip().lower()
     if p == "realistic":
         return REGEN2K_SIGMAS
+    if p in ("start_08", "start_0.8", "stylized_08", "0.8"):
+        return REGEN2K_SIGMAS_START_08
     if p == "stylized":
         return REGEN2K_SIGMAS_STYLIZED
     raise ValueError(f"{TAG}: unknown regen2k_preset {preset!r} "
@@ -1062,6 +1065,8 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
         _sig_cpu = sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor) else torch.tensor(list(sigmas), dtype=torch.float32)
         _preset_tag = ("stylized" if _sig_cpu.shape == REGEN2K_SIGMAS_STYLIZED.shape
                        and torch.allclose(_sig_cpu, REGEN2K_SIGMAS_STYLIZED)
+                       else "start_08" if _sig_cpu.shape == REGEN2K_SIGMAS_START_08.shape
+                       and torch.allclose(_sig_cpu, REGEN2K_SIGMAS_START_08)
                        else "realistic" if _sig_cpu.shape == REGEN2K_SIGMAS.shape
                        and torch.allclose(_sig_cpu, REGEN2K_SIGMAS)
                        else None)
@@ -1294,7 +1299,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         w_px, h_px = target_size(video.shape[4] * SPATIAL, video.shape[3] * SPATIAL,
                                  megapixels)
     model = _apply_low_vram_patches(model, attn_chunks, ffn_chunks)
-    if sigmas is not None:
+    is_regen2k = sigmas is not None
+    if is_regen2k:
         sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
                   else torch.tensor(list(sigmas), dtype=torch.float32))
         chunk_frames, _ = _regen2k_chunk_frames(w_px, h_px, budget, chunk_frames, overlap_px)
@@ -1369,7 +1375,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
             continue
         ccond = cond_for_chunk(clean_refs(conditioning(f0, f1)) if per_chunk
                                else cond, f0, f1, cv.shape[3], cv.shape[4])
-        if i > 0:
+        if i > 0 and not is_regen2k:
             ccond = pin_chunk_start(ccond, out_v[:, :, :end_v], f0, anchor)
         glat = glats[i]
         glats[i] = None

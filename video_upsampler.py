@@ -169,8 +169,9 @@ class HTCVideoUpsampler:
                 "regen2k_preset": (list(_tu.REGEN2K_PRESETS), {
                     "default": "realistic",
                     "tooltip": ("Regen2K sigma schedule preset: 'realistic' runs "
-                                "[0.909375, 6/7, 2/3, 0] (3 Euler steps); 'stylized' runs "
-                                "[0.6, 0.4, 0.2, 0.0] (3 Euler steps, lighter re-draw for "
+                                "[0.909375, 6/7, 2/3, 0] (3 Euler steps); 'start_08' runs "
+                                "[0.8, 24/35, 0.48, 0] (shift-6 from 0.8 to stay closer to draft); "
+                                "'stylized' runs [0.6, 0.4, 0.2, 0.0] (lighter re-draw for "
                                 "2.5D/animated content to reduce new detail and character drift).")}),
             },
             "optional": {

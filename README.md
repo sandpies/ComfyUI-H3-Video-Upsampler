@@ -30,7 +30,7 @@ Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 | `lora` | Open-H3-Regenerate-2K LoRA from `models/loras` (`open_h3_regen2k_refiner_r256pp_bf16.safetensors` by default) |
 | `tile_tokens` | **VRAM.** Largest sequence per tile; lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
 | `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |
-| `regen2k_preset` | `realistic` (`[0.909375, 6/7, 2/3, 0]`, default) or `stylized` (`[0.6, 0.4, 0.2, 0.0]`, lighter re-draw for 2.5D/animated content) |
+| `regen2k_preset` | `realistic` (`[0.909375, 6/7, 2/3, 0]`, default), `start_08` (`[0.8, 24/35, 0.48, 0]`, shift-6 from 0.8), or `stylized` (`[0.6, 0.4, 0.2, 0.0]`, lighter re-draw for 2.5D/animated content) |
 
 The recipe: 102-frame chunks sharing 17, anchor 0.999, 70000-token tiles with
 128 px overlap, seed 444.
