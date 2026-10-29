@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-h3-video-upsampler"
-version = "0.3.0"
-description = "Upscale a finished MiniMax H3 clip: H3 latent upscaler + one light re-draw step in tiles (the original MMH3 recipe), and a long-form save node."
+version = "0.4.0"
+description = "Upscale a finished MiniMax H3 clip: H3 latent upscaler + a 3-step Open-H3-Regenerate-2K re-draw in tiles, and a long-form save node."
 license = { file = "LICENSE" }
 dependencies = []
 

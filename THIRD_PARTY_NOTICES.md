@@ -27,7 +27,7 @@ pack is installed and requires identical latents.
 
 The 3-step Regenerate-2K schedule (`[0.8, 24/35, 0.48, 0]`; release `[0.909375, 6/7, 2/3, 0]`) and refiner LoRA are
 from NVlabs' [Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
-(Apache-2.0) and [Kijai/MiniMax-H3-experimental](https://huggingface.co/Kijai/MiniMax-H3-experimental).
+and [Kijai/MiniMax-H3-experimental](https://huggingface.co/Kijai/MiniMax-H3-experimental).
 
 ## `upscale_guide.py` -- the h3upscale guide layout
 
@@ -37,9 +37,10 @@ grid) is the layout of [Alissonerdx](https://huggingface.co/Alissonerdx)'s
 ai-toolkit fork, branch `minimax-h3-latent-guides` (ai-toolkit: MIT). No code
 was copied; this pack's checker compared the two layouts row for row.
 
-## `lora/h3upscale_v2_x2.safetensors` (retired, kept on Hugging Face)
+## `lora/open_h3_regenerate_2k_r256pp_bf16.safetensors` (Hugging Face only)
 
-Trained by Sandpies with that fork on Alissonerdx's
-[h3upscale-4k](https://huggingface.co/datasets/Alissonerdx/h3upscale-4k)
-dataset, on the MiniMax H3 Ref2VA base. Read both of their terms before
-redistributing or using it commercially.
+A rank-256 compression of the
+[Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+LoRA, redistributed under its license, the
+[MiniMax H3 community license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/6818f6c32d12b210915e44ad56a4228c2608f160/LICENSE).
+Read it before using the LoRA commercially.

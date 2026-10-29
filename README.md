@@ -3,9 +3,8 @@
 > A mirror of this code: [Hugging Face](https://huggingface.co/sandpies/ComfyUI-H3-Video-Upsampler)
 
 Upscale a **finished** MiniMax H3 clip (or any clip) in ComfyUI: the H3 latent
-upscaler enlarges it, then one light re-draw step in tiles restores detail -- the
-original MMH3 Ultimate Upscale recipe, the same upsampler Hand-Tie-Clips runs over a
-whole chain. Mouths, motion and the soundtrack come from your clip. **H3 Save Video
+upscaler enlarges it, then a 3-step Open-H3-Regenerate-2K re-draw in tiles restores
+detail -- the same upsampler Hand-Tie-Clips runs over a whole chain. Mouths, motion and the soundtrack come from your clip. **H3 Save Video
 (long-form)** writes the result without holding the film in RAM.
 
 ## Install
@@ -14,8 +13,8 @@ whole chain. Mouths, motion and the soundtrack come from your clip. **H3 Save Vi
 2. Put the latent upscaler `minimax_h3_latent_upscaler_3d_bf16.safetensors` in
    `ComfyUI/models/latent_upscale_models`
    ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler))
-   and the Regen2K LoRA `open_h3_regenerate_2k_r256pp_bf16.safetensors`
-   in `ComfyUI/models/loras`.
+   and the Regen2K LoRA [`open_h3_regenerate_2k_r256pp_bf16.safetensors`](https://huggingface.co/sandpies/ComfyUI-H3-Video-Upsampler/blob/main/lora/open_h3_regenerate_2k_r256pp_bf16.safetensors)
+   (3.77 GB, from this pack's Hugging Face `lora/`) in `ComfyUI/models/loras`.
 3. Load `example_workflows/H3_Video_Upsampler.json`, pick a clip, queue.
 
 Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
@@ -31,8 +30,8 @@ Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 | `tile_tokens` | **VRAM.** Largest sequence per tile; lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
 | `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |
 
-The recipe: 102-frame chunks sharing 17, anchor 0.999, 70000-token tiles with
-128 px overlap, seed 444.
+The recipe: 102-frame chunks sharing 17, 70000-token tiles with 128 px overlap,
+fresh noise per chunk, the soundtrack pinned clean.
 
 - Wire a **plain** diffusion model loader as `model` (no LoRAs): LoRAs under the
   re-draw add their own texture.
@@ -57,11 +56,10 @@ high / max / archive), with a keyframe on every hard cut and every 2 s. Without
 CUDA it encodes on the CPU (x264 / x265 / SVT-AV1). The soundtrack is trimmed or
 padded to the picture. The workflow wires the clip's own fps into it.
 
-## The h3upscale x2 LoRA (retired)
+## The h3upscale x2 LoRA (removed)
 
-Earlier versions guided the re-draw with an h3upscale x2 LoRA. Against the plain
-recipe it cost fine detail and drew tile grids at 2 MP, so 0.3.0 runs the recipe
-with no LoRA. The file stays on Hugging Face under `lora/` for reference.
+Versions up to 0.2.2 guided the re-draw with an h3upscale x2 LoRA. 0.4.0 replaces
+it with the Regen2K LoRA and the old file is gone from `lora/`.
 
 ## Credits
 
