@@ -25,7 +25,7 @@ pack is installed and requires identical latents.
 
 ## Open-H3-Regenerate-2K (`redraw=regen2k`)
 
-The 3-step Regenerate-2K schedule (`[0.909375, 6/7, 2/3, 0]`) and refiner LoRA are
+The 3-step Regenerate-2K schedule (`[0.8, 24/35, 0.48, 0]`; release `[0.909375, 6/7, 2/3, 0]`) and refiner LoRA are
 from NVlabs' [Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
 (Apache-2.0) and [Kijai/MiniMax-H3-experimental](https://huggingface.co/Kijai/MiniMax-H3-experimental).
 

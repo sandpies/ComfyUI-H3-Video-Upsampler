@@ -166,13 +166,6 @@ class HTCVideoUpsampler:
                 "redraw_seed": ("INT", {
                     "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
                     "tooltip": "Noise seed for the Regen2K re-draw (default: 42)."}),
-                "regen2k_preset": (list(_tu.REGEN2K_PRESETS), {
-                    "default": "realistic",
-                    "tooltip": ("Regen2K sigma schedule preset: 'realistic' runs "
-                                "[0.909375, 6/7, 2/3, 0] (3 Euler steps); 'start_08' runs "
-                                "[0.8, 24/35, 0.48, 0] (shift-6 from 0.8 to stay closer to draft); "
-                                "'stylized' runs [0.6, 0.4, 0.2, 0.0] (lighter re-draw for "
-                                "2.5D/animated content to reduce new detail and character drift).")}),
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "The clip's soundtrack. Passed through untouched."}),
@@ -188,13 +181,13 @@ class HTCVideoUpsampler:
     CATEGORY = "video/upscale"
     DESCRIPTION = (
         "Upsamples a finished clip with Open-H3-Regenerate-2K: H3 3D latent upscale, then "
-        "3 Euler steps on [0.909375, 6/7, 2/3, 0] with zeroed-out conditioning and the "
+        "3 Euler steps on [0.8, 24/35, 0.48, 0] with zeroed-out conditioning and the "
         "soundtrack pinned clean (noise=per_chunk, seed 42). tile_tokens lets a smaller card "
         "shorten chunks or cut more tiles.")
 
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
-            regen2k_preset="realistic", audio=None, audio_vae=None):
+            audio=None, audio_vae=None):
         import comfy.nested_tensor as nt
         import comfy.samplers
         import folder_paths
@@ -211,8 +204,7 @@ class HTCVideoUpsampler:
                 "which ComfyUI's stock VAELoader skips). Pick "
                 "minimax_h3_lynnreal_light_vae_int8_convrot.safetensors or "
                 "minimax_h3_video_vae_int8_convrot.safetensors in VAELoader.")
-        r2k_sigmas = _tu.regen2k_sigmas_for_preset(regen2k_preset)
-        preset_name = str(regen2k_preset or "realistic").strip().lower()
+        r2k_sigmas = _tu.REGEN2K_SIGMAS
         n = int(images.shape[0])
         if n < 1:
             raise ValueError(f"{TAG}: no frames")
@@ -268,7 +260,7 @@ class HTCVideoUpsampler:
         print(f"[{TAG}] {n} frames at {int(images.shape[2])}x{int(images.shape[1])} -> H3 "
               f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}; "
               f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag}, "
-              f"preset={preset_name}, sigmas {sig_list})", flush=True)
+              f"sigmas {sig_list})", flush=True)
         _cd = _tu.CHAIN_DEFAULTS
         overlap_px = int(_cd["tile_overlap_px"])
         if eff_strength <= 0.0:
@@ -292,7 +284,7 @@ class HTCVideoUpsampler:
         del out
         report = (f"{n} frames {int(images.shape[2])}x{int(images.shape[1])} -> "
                   f"{int(img.shape[2])}x{int(img.shape[1])}"
-                  f", regen2k ({lora_tag}, preset={preset_name}, {steps} steps)"
+                  f", regen2k ({lora_tag}, {steps} steps)"
                   f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
         print(f"[{TAG}] {report}", flush=True)
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),

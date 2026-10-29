@@ -74,24 +74,9 @@ class _DefaultInt(int):
 _DEFAULT_CHUNK_FRAMES = _DefaultInt(CHUNK_FRAMES)
 REGEN2K_MIN_CHUNK_FRAMES = 68
 REGEN2K_SEED = 42
-REGEN2K_SIGMAS = torch.tensor([0.909375, 6.0 / 7.0, 2.0 / 3.0, 0.0], dtype=torch.float32)
-REGEN2K_SIGMAS_START_08 = torch.tensor([0.8, 24.0 / 35.0, 0.48, 0.0], dtype=torch.float32)
-REGEN2K_SIGMAS_STYLIZED = torch.tensor([0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
+REGEN2K_SIGMAS = torch.tensor([0.8, 24.0 / 35.0, 0.48, 0.0], dtype=torch.float32)
+REGEN2K_SIGMAS_RELEASE = torch.tensor([0.909375, 6.0 / 7.0, 2.0 / 3.0, 0.0], dtype=torch.float32)
 REGEN2K_SIGMAS_2STEP = torch.tensor([0.7, 0.494118, 0.0], dtype=torch.float32)
-REGEN2K_PRESETS = ("realistic", "start_08", "stylized")
-
-
-def regen2k_sigmas_for_preset(preset="realistic"):
-    """Return the 4-sigma Regen2K schedule tensor for `preset`."""
-    p = str(preset or "realistic").strip().lower()
-    if p == "realistic":
-        return REGEN2K_SIGMAS
-    if p in ("start_08", "start_0.8", "stylized_08", "0.8"):
-        return REGEN2K_SIGMAS_START_08
-    if p == "stylized":
-        return REGEN2K_SIGMAS_STYLIZED
-    raise ValueError(f"{TAG}: unknown regen2k_preset {preset!r} "
-                     f"(expected one of {list(REGEN2K_PRESETS)})")
 
 # --- the guided re-draw (not part of the recipe) ----------------------------
 #
@@ -256,6 +241,47 @@ def chunks(tokens, length=CHUNK_FRAMES, overlap=CHUNK_OVERLAP):
             return out
         prev_end = k1
         i += 1
+
+
+def regen2k_chunks(tokens, length=CHUNK_FRAMES, overlap=CHUNK_OVERLAP,
+                   w_px=0, h_px=0, budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX):
+    """[(k0, f0, k1, f1)] for Regen2K: eliminates short tail-stub chunks (< 20 steps).
+
+    A 192-frame (57-step) clip under standard 102/17 f chunking ends with a 7-step
+    (22-frame) stub `(50, 170, 57, 192)` just to cover the last 2 steps (5 frames);
+    3 high-sigma Euler steps on a 7-step stub hallucinate end-of-clip artifacts.
+    1. When the final chunk adds <= 5 new steps (<= 17 frames) and absorbing it into
+       the previous chunk keeps the same spatial tile grid under `budget`, merge them.
+    2. Otherwise, when the final chunk is shorter than 20 steps (68 frames), slide its
+       start back on the 5-step key grid so it runs at least 20 steps (bounded by
+       `pk0 + 5` so chunk starts strictly advance and never exceed the previous chunk's
+       length).
+    """
+    plan = chunks(tokens, length, overlap)
+    if len(plan) < 2:
+        return plan
+    pk0, pf0, pk1, pf1 = plan[-2]
+    lk0, lf0, lk1, lf1 = plan[-1]
+    rem_steps = lk1 - pk1
+    merged_steps = lk1 - pk0
+    if rem_steps <= 5:
+        can_absorb = True
+        if w_px > 0 and h_px > 0:
+            ov = snap_overlap(overlap_px)
+            g_base = solve_grid(w_px, h_px, pk1 - pk0, overlap_px=ov, budget=int(budget))
+            g_merged = solve_grid(w_px, h_px, merged_steps, overlap_px=ov, budget=int(budget))
+            can_absorb = (g_merged is not None and g_base is not None
+                          and (g_merged[0], g_merged[1]) == (g_base[0], g_base[1]))
+        if can_absorb:
+            plan[-2] = (pk0, pf0, lk1, lf1)
+            plan.pop()
+            return plan
+    min_steps = max(5, min((int(length) // 17) * 5, (REGEN2K_MIN_CHUNK_FRAMES // 17) * 5))
+    if (lk1 - lk0) < min_steps:
+        new_k0 = max(pk0 + 5, ((lk1 - min_steps) // 5) * 5)
+        if new_k0 < lk0:
+            plan[-1] = (new_k0, frames_in(new_k0), lk1, lf1)
+    return plan
 
 
 # --- space: the tile grid ---------------------------------------------------
@@ -1062,20 +1088,10 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
         tokens = (seq_len(grid[2], grid[3], t) if int(factor) <= 1
                   else f"{guided_seq_len(grid[2], grid[3], t, factor)} (guide incl.)")
         _sig_s = [round(float(s), 4) for s in sigmas]
-        _sig_cpu = sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor) else torch.tensor(list(sigmas), dtype=torch.float32)
-        _preset_tag = ("stylized" if _sig_cpu.shape == REGEN2K_SIGMAS_STYLIZED.shape
-                       and torch.allclose(_sig_cpu, REGEN2K_SIGMAS_STYLIZED)
-                       else "start_08" if _sig_cpu.shape == REGEN2K_SIGMAS_START_08.shape
-                       and torch.allclose(_sig_cpu, REGEN2K_SIGMAS_START_08)
-                       else "realistic" if _sig_cpu.shape == REGEN2K_SIGMAS.shape
-                       and torch.allclose(_sig_cpu, REGEN2K_SIGMAS)
-                       else None)
         print(f"[{TAG}] chunk {w * SPATIAL}x{h * SPATIAL}px x {t} latent steps: "
               f"{grid[0]}x{grid[1]} tiles of {grid[2]}x{grid[3]}px, overlap "
               f"{grid[4]}/{grid[5]}px, {tokens} tokens per "
-              f"forward, stepped together"
-              + (f", preset={_preset_tag}" if _preset_tag else "")
-              + f", sigmas {_sig_s}"
+              f"forward, stepped together, sigmas {_sig_s}"
               + (f", high-pass detail={float(detail_sigma):g}" if float(detail_sigma or 0.0) > 0.0 else ""),
               flush=True)
 
@@ -1304,9 +1320,11 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
                   else torch.tensor(list(sigmas), dtype=torch.float32))
         chunk_frames, _ = _regen2k_chunk_frames(w_px, h_px, budget, chunk_frames, overlap_px)
+        plan = regen2k_chunks(tv, int(chunk_frames), int(chunk_overlap),
+                              w_px=w_px, h_px=h_px, budget=budget, overlap_px=overlap_px)
     else:
         sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
-    plan = chunks(tv, int(chunk_frames), int(chunk_overlap))
+        plan = chunks(tv, int(chunk_frames), int(chunk_overlap))
     print(f"[{TAG}] {video.shape[4] * SPATIAL}x{video.shape[3] * SPATIAL} -> "
           f"{w_px}x{h_px} ({w_px * h_px / 1048576.0:.2f} MP), {len(plan)} "
           f"chunk(s), "
