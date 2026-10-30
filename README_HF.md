@@ -27,7 +27,7 @@ detail -- the same upsampler Hand-Tie-Clips runs over a whole chain. Mouths, mot
    ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler))
    and the Regen2K LoRA [`open_h3_regenerate_2k_r256pp_bf16.safetensors`](https://huggingface.co/sandpies/ComfyUI-H3-Video-Upsampler/blob/main/lora/open_h3_regenerate_2k_r256pp_bf16.safetensors)
    (3.77 GB, from this pack's Hugging Face `lora/`) in `ComfyUI/models/loras`.
-3. Load `example_workflows/H3_Video_Upsampler.json`, pick a clip, queue.
+3. Load `example_workflows/H3_Video_Upsampler_File.json` (recommended: any length, flat RAM) or `example_workflows/H3_Video_Upsampler.json` (IMAGE in, IMAGE out), pick a clip, queue.
 
 Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 `minimax_h3_fl2va_pruned_int8_convrot` DiT, video and audio VAE).
@@ -62,6 +62,32 @@ fresh noise per chunk, the soundtrack pinned clean.
   in slices so a long clip never sits in RAM as one tensor.
 - Any frame size and length: frames are fitted to 32 px and padded to a valid H3
   length, then the padding is trimmed off again.
+
+## The node: H3 Video Upsampler (file to file)
+
+The same upsampler, from a **Load Video** straight to an MP4. Use it for
+anything longer than a short clip, or on a machine with less RAM.
+
+The IMAGE node is limited by ComfyUI's IMAGE type. Get Video Components
+decodes the whole clip into one float32 tensor (briefly twice while it stacks
+the frames), the node makes a fitted copy, and it returns the whole result as
+another tensor. At 2 MP, one minute at 24 fps is about 16 GB in and 36 GB
+out; at 48 fps it's about 32 GB in and 72 GB out. The re-draw in between only
+needs the latent, which is about 100 MB for that minute.
+
+The file node never holds the frames:
+
+1. It reads the video 102 frames at a time and encodes each piece as it
+   arrives. The H3 VAE encodes every 17 frames on their own, so the latent is
+   exactly what the whole clip encodes to.
+2. It runs the same 3D upscale and Regen2K re-draw as the IMAGE node.
+3. It decodes slice by slice straight into H3 Save Video's streaming encoder
+   (NVENC, keyframes on cuts, `frame_gen`).
+
+RAM stays at a few GB however long the film is. The frame rate and
+soundtrack come from the file, so `off_24_audio` always knows the real rate.
+Widgets are the IMAGE node's, plus H3 Save Video's `frame_gen`, `codec`,
+`quality` and `filename_prefix`.
 
 ## Guiding the re-draw
 

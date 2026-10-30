@@ -1,0 +1,331 @@
+{
+ "id": "h3-video-upsampler-file",
+ "revision": 0,
+ "last_node_id": 7,
+ "last_link_id": 5,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "MarkdownNote",
+   "pos": [
+    -900,
+    -560
+   ],
+   "size": [
+    640,
+    560
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "MarkdownNote"
+   },
+   "widgets_values": [
+    "## H3 Video Upsampler (file to file)\n\nThe same re-draw as the IMAGE workflow, for clips of any length on any machine: the video is read, encoded, re-drawn, decoded and saved **a chunk at a time**, so RAM stays flat however long the film is (the IMAGE path holds the whole clip twice; a minute at 48 fps is over 100 GB).\n\n1. **Load Video**: pick the clip. Frame rate and soundtrack come from the file.\n2. **Queue.** The MP4 lands in `video/H3_upsampled` with the original soundtrack.\n\n### The node\n- **megapixels / denoise / lora / tile_tokens / redraw_seed**: as in the IMAGE workflow.\n- **structure_lock** (0 = off) holds faces, hands and line work to the clip; try 0.5-1. **lock_sigma** 1-1.5 also holds eyes and mouths on medium shots.\n- **off_24_audio**: H3 runs on a 24 fps clock; for other rates `retime` keeps the re-draw's lip sync.\n- **frame_gen / codec / quality**: as in H3 Save Video. x2 doubles the frame rate (RTX + `nvidia-vfx`).\n- **conditioning** (optional): a CLIPTextEncode of the clip's look. Unwired = zeroed out."
+   ]
+  },
+  {
+   "id": 2,
+   "type": "UNETLoader",
+   "pos": [
+    -900,
+    0
+   ],
+   "size": [
+    420,
+    82
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      2
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "UNETLoader"
+   },
+   "widgets_values": [
+    "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "default"
+   ],
+   "title": "Load Diffusion Model (plain, no LoRAs)"
+  },
+  {
+   "id": 3,
+   "type": "VAELoader",
+   "pos": [
+    -900,
+    140
+   ],
+   "size": [
+    420,
+    58
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "VAE",
+     "type": "VAE",
+     "links": [
+      3
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAELoader"
+   },
+   "widgets_values": [
+    "minimax_h3_video_vae_int8_convrot.safetensors"
+   ]
+  },
+  {
+   "id": 4,
+   "type": "VAELoader",
+   "pos": [
+    -900,
+    240
+   ],
+   "size": [
+    420,
+    58
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "VAE",
+     "type": "VAE",
+     "links": [
+      4
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAELoader"
+   },
+   "widgets_values": [
+    "minimax_h3_audio_vae_fp32.safetensors"
+   ],
+   "title": "Load VAE (audio)"
+  },
+  {
+   "id": 5,
+   "type": "LoadVideo",
+   "pos": [
+    -420,
+    -560
+   ],
+   "size": [
+    320,
+    420
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "VIDEO",
+     "type": "VIDEO",
+     "links": [
+      1
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "LoadVideo"
+   },
+   "widgets_values": [
+    "",
+    "image"
+   ],
+   "title": "clip to upscale"
+  },
+  {
+   "id": 6,
+   "type": "H3VideoUpsamplerToFile",
+   "pos": [
+    -60,
+    -560
+   ],
+   "size": [
+    420,
+    460
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "video",
+     "type": "VIDEO",
+     "link": 1
+    },
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 2
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 3
+    },
+    {
+     "name": "audio_vae",
+     "type": "VAE",
+     "link": 4,
+     "shape": 7
+    },
+    {
+     "name": "conditioning",
+     "type": "CONDITIONING",
+     "link": null,
+     "shape": 7
+    }
+   ],
+   "outputs": [
+    {
+     "name": "video",
+     "type": "VIDEO",
+     "links": [],
+     "slot_index": 0
+    },
+    {
+     "name": "filepath",
+     "type": "STRING",
+     "links": [],
+     "slot_index": 1
+    },
+    {
+     "name": "report",
+     "type": "STRING",
+     "links": [
+      5,
+      5
+     ],
+     "slot_index": 2
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "H3VideoUpsamplerToFile"
+   },
+   "widgets_values": [
+    "minimax_h3_latent_upscaler_3d_bf16.safetensors",
+    2.0,
+    0.8,
+    "open_h3_regenerate_2k_r256pp_bf16.safetensors",
+    70000,
+    "euler",
+    42,
+    0.0,
+    2.0,
+    "retime",
+    "off",
+    "auto",
+    "max",
+    "video/H3_upsampled"
+   ]
+  },
+  {
+   "id": 7,
+   "type": "PreviewAny",
+   "pos": [
+    -60,
+    -60
+   ],
+   "size": [
+    420,
+    120
+   ],
+   "flags": {},
+   "order": 7,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "source",
+     "type": "*",
+     "link": 5
+    }
+   ],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "PreviewAny"
+   },
+   "title": "report"
+  }
+ ],
+ "links": [
+  [
+   1,
+   5,
+   0,
+   6,
+   0,
+   "VIDEO"
+  ],
+  [
+   2,
+   2,
+   0,
+   6,
+   1,
+   "MODEL"
+  ],
+  [
+   3,
+   3,
+   0,
+   6,
+   2,
+   "VAE"
+  ],
+  [
+   4,
+   4,
+   0,
+   6,
+   3,
+   "VAE"
+  ],
+  [
+   5,
+   6,
+   2,
+   7,
+   0,
+   "STRING"
+  ]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.7,
+   "offset": [
+    950,
+    620
+   ]
+  }
+ },
+ "version": 0.4
+}

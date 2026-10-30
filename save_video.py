@@ -223,154 +223,171 @@ class HTCSaveVideo:
 
     def run(self, images, fps, frame_gen, codec, quality, filename_prefix,
             audio=None, prompt=None, extra_pnginfo=None):
-        import comfy.model_management as mm
-        import comfy.utils
-        import folder_paths
-
         if images is None or images.ndim != 4 or images.shape[0] == 0:
             raise ValueError(f"[{TAG}] needs a non-empty IMAGE batch.")
         n_src, h_in, w_in, _ = images.shape
-        height, width = h_in - h_in % 2, w_in - w_in % 2
+        chunk = max(1, CHUNK_PIXELS // (int(w_in) * int(h_in)))
+        parts = (images[s:s + chunk] for s in range(0, int(n_src), chunk))
+        return encode_stream(parts, int(n_src), int(w_in), int(h_in), fps, frame_gen, codec,
+                             quality, filename_prefix, audio, prompt, extra_pnginfo)
 
-        device = mm.get_torch_device()
-        use_gpu = device.type == "cuda"
-        mult = FRAME_GEN[frame_gen]
-        if mult > 1 and not use_gpu:
-            print(f"[{TAG}] frame_gen needs CUDA; saving at the source frame rate.", flush=True)
-            mult = 1
-        out_fps = float(fps) * mult
-        n_out = n_src * mult
 
-        enc_name = _pick_codec(codec, use_gpu, width, height)
-        gop = max(1, round(out_fps * KEYFRAME_SECONDS))
+def encode_stream(parts, n_src, w_in, h_in, fps, frame_gen, codec, quality, filename_prefix,
+                  audio=None, prompt=None, extra_pnginfo=None):
+    """HTCSaveVideo's whole pass over `parts`, an iterable of [k, h_in, w_in, 3+]
+    frame batches (any device) totalling `n_src` frames. It is consumed lazily,
+    so a producer that decodes as it goes never holds the film. -> the node's
+    {"ui", "result"} dict."""
+    import comfy.model_management as mm
+    import comfy.utils
+    import folder_paths
 
-        out_dir, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
-            filename_prefix, folder_paths.get_output_directory(), width, height)
-        os.makedirs(out_dir, exist_ok=True)
-        file = f"{filename}_{counter:05}_.mp4"
-        path = os.path.join(out_dir, file)
+    height, width = h_in - h_in % 2, w_in - w_in % 2
 
-        t0 = time.perf_counter()
-        container = av.open(path, mode="w", options={"movflags": "use_metadata_tags+faststart"})
-        fx = None
-        writer = None
-        ok = False
-        try:
-            if not _metadata_disabled():
-                if prompt is not None:
-                    container.metadata["prompt"] = json.dumps(prompt)
-                for k, v in (extra_pnginfo or {}).items():
-                    container.metadata[k] = json.dumps(v)
+    device = mm.get_torch_device()
+    use_gpu = device.type == "cuda"
+    mult = FRAME_GEN[frame_gen]
+    if mult > 1 and not use_gpu:
+        print(f"[{TAG}] frame_gen needs CUDA; saving at the source frame rate.", flush=True)
+        mult = 1
+    out_fps = float(fps) * mult
+    n_out = n_src * mult
 
-            rate = Fraction(round(out_fps * 1000), 1000)
-            vs = container.add_stream(enc_name, rate=rate)
-            vs.width, vs.height = width, height
-            vs.pix_fmt = "nv12" if enc_name in ("h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264") else "yuv420p"
-            vs.options = _encoder_options(enc_name, quality, gop)
-            if enc_name.endswith("_nvenc"):
-                vs.bit_rate = 0
-            _tag_bt709(vs.codec_context)
+    enc_name = _pick_codec(codec, use_gpu, width, height)
+    gop = max(1, round(out_fps * KEYFRAME_SECONDS))
 
-            a_packets = []
-            if audio is not None and audio.get("waveform") is not None and audio["waveform"].numel():
-                sr = int(audio["sample_rate"])
-                a_np = _stereo(audio, round(n_src / float(fps) * sr))
-                ast = container.add_stream("aac", rate=sr, layout="stereo")
-                ast.bit_rate = QUALITY[quality]["audio_kbps"] * 1000
-                af = av.AudioFrame.from_ndarray(a_np, format="fltp", layout="stereo")
-                af.sample_rate = sr
-                af.pts = 0
-                a_packets = list(ast.encode(af)) + list(ast.encode(None))
+    out_dir, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+        filename_prefix, folder_paths.get_output_directory(), width, height)
+    os.makedirs(out_dir, exist_ok=True)
+    file = f"{filename}_{counter:05}_.mp4"
+    path = os.path.join(out_dir, file)
 
-            q = queue.Queue(maxsize=QUEUE_CHUNKS)
-            err = []
-            writer = threading.Thread(
-                target=_mux_loop, args=(q, container, vs, a_packets, float(rate), err),
-                name=f"{TAG}-mux", daemon=True)
-            writer.start()
+    t0 = time.perf_counter()
+    container = av.open(path, mode="w", options={"movflags": "use_metadata_tags+faststart"})
+    fx = None
+    writer = None
+    ok = False
+    try:
+        if not _metadata_disabled():
+            if prompt is not None:
+                container.metadata["prompt"] = json.dumps(prompt)
+            for k, v in (extra_pnginfo or {}).items():
+                container.metadata[k] = json.dumps(v)
 
-            def put(item):
-                while True:
-                    if err:
-                        raise err[0]
-                    try:
-                        q.put(item, timeout=0.5)
-                        return
-                    except queue.Full:
-                        if not writer.is_alive():
-                            raise RuntimeError(f"[{TAG}] muxer stopped") from (err[0] if err else None)
+        rate = Fraction(round(out_fps * 1000), 1000)
+        vs = container.add_stream(enc_name, rate=rate)
+        vs.width, vs.height = width, height
+        vs.pix_fmt = "nv12" if enc_name in ("h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264") else "yuv420p"
+        vs.options = _encoder_options(enc_name, quality, gop)
+        if enc_name.endswith("_nvenc"):
+            vs.bit_rate = 0
+        _tag_bt709(vs.codec_context)
 
-            if mult > 1:
-                fx = _FrameGen(mult, width, height, device)
-            chunk = max(1, CHUNK_PIXELS // (width * height))
-            pbar = comfy.utils.ProgressBar(n_out)
-            state = {"prev_thumb": None, "since_key": 0}
-            pending = []
+        a_packets = []
+        if audio is not None and audio.get("waveform") is not None and audio["waveform"].numel():
+            sr = int(audio["sample_rate"])
+            a_np = _stereo(audio, round(n_src / float(fps) * sr))
+            ast = container.add_stream("aac", rate=sr, layout="stereo")
+            ast.bit_rate = QUALITY[quality]["audio_kbps"] * 1000
+            af = av.AudioFrame.from_ndarray(a_np, format="fltp", layout="stereo")
+            af.sample_rate = sr
+            af.pts = 0
+            a_packets = list(ast.encode(af)) + list(ast.encode(None))
 
-            def flush():
-                if not pending:
+        q = queue.Queue(maxsize=QUEUE_CHUNKS)
+        err = []
+        writer = threading.Thread(
+            target=_mux_loop, args=(q, container, vs, a_packets, float(rate), err),
+            name=f"{TAG}-mux", daemon=True)
+        writer.start()
+
+        def put(item):
+            while True:
+                if err:
+                    raise err[0]
+                try:
+                    q.put(item, timeout=0.5)
                     return
-                batch = torch.stack(pending)
-                pending.clear()
-                nv12, y = rgb_to_nv12(batch)
-                keys = _cut_flags(y, state, gop)
-                put((nv12.cpu().numpy(), keys))
-                pbar.update(len(keys))
+                except queue.Full:
+                    if not writer.is_alive():
+                        raise RuntimeError(f"[{TAG}] muxer stopped") from (err[0] if err else None)
 
-            for s in range(0, n_src, chunk):
+        if mult > 1:
+            fx = _FrameGen(mult, width, height, device)
+        chunk = max(1, CHUNK_PIXELS // (width * height))
+        pbar = comfy.utils.ProgressBar(n_out)
+        state = {"prev_thumb": None, "since_key": 0}
+        pending = []
+
+        def flush():
+            if not pending:
+                return
+            batch = torch.stack(pending)
+            pending.clear()
+            nv12, y = rgb_to_nv12(batch)
+            keys = _cut_flags(y, state, gop)
+            put((nv12.cpu().numpy(), keys))
+            pbar.update(len(keys))
+
+        sent = 0
+        for part in parts:
+            for s in range(0, int(part.shape[0]), chunk):
                 mm.throw_exception_if_processing_interrupted()
-                src = images[s:s + chunk, :height, :width, :3].to(device, non_blocking=True)
+                src = part[s:s + chunk, :height, :width, :3].to(device, non_blocking=True)
                 for i in range(src.shape[0]):
                     pending.extend(fx.feed(src[i]) if fx is not None else [src[i]])
                     if len(pending) >= chunk:
                         flush()
-            if fx is not None:
-                pending.extend(fx.finish())
-                fx = None
-            flush()
-            put(None)
-            writer.join()
-            if err:
-                raise err[0]
-            ok = True
-        finally:
-            if fx is not None:
-                fx.close()
-            if writer is not None and writer.is_alive():
-                while True:   # make room for the stop sentinel, dropping unsent frames
-                    try:
-                        q.put_nowait(None)
-                        break
-                    except queue.Full:
-                        try:
-                            q.get_nowait()
-                        except queue.Empty:
-                            pass
-                writer.join(timeout=30)
-            container.close()
-            if not ok and os.path.exists(path):
+                sent += int(src.shape[0])
+        if sent != n_src:
+            raise RuntimeError(f"[{TAG}] {sent} frames arrived, {n_src} announced")
+        if fx is not None:
+            pending.extend(fx.finish())
+            fx = None
+        flush()
+        put(None)
+        writer.join()
+        if err:
+            raise err[0]
+        ok = True
+    finally:
+        if fx is not None:
+            fx.close()
+        if writer is not None and writer.is_alive():
+            while True:   # make room for the stop sentinel, dropping unsent frames
                 try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            if use_gpu:
-                mm.soft_empty_cache()
+                    q.put_nowait(None)
+                    break
+                except queue.Full:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+            writer.join(timeout=30)
+        container.close()
+        if not ok and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if use_gpu:
+            mm.soft_empty_cache()
 
-        secs = time.perf_counter() - t0
-        dur = n_out / out_fps
-        report = (f"{file}: {n_out} frames {width}x{height} @ {out_fps:g} fps "
-                  f"({dur:.1f} s), {enc_name} {quality}"
-                  f"{', frame gen x' + str(mult) if mult > 1 else ''}; "
-                  f"saved in {secs:.1f} s ({dur / max(secs, 1e-6):.1f}x real time), "
-                  f"{os.path.getsize(path) / 1e6:.0f} MB"
-                  + ("" if a_packets else "; NO AUDIO (the audio input is not wired, or empty)"))
-        print(f"[{TAG}] {report}", flush=True)
+    secs = time.perf_counter() - t0
+    dur = n_out / out_fps
+    report = (f"{file}: {n_out} frames {width}x{height} @ {out_fps:g} fps "
+              f"({dur:.1f} s), {enc_name} {quality}"
+              f"{', frame gen x' + str(mult) if mult > 1 else ''}; "
+              f"saved in {secs:.1f} s ({dur / max(secs, 1e-6):.1f}x real time), "
+              f"{os.path.getsize(path) / 1e6:.0f} MB"
+              + ("" if a_packets else "; NO AUDIO (the audio input is not wired, or empty)"))
+    print(f"[{TAG}] {report}", flush=True)
 
-        from comfy_api.latest import InputImpl
-        video = InputImpl.VideoFromFile(path)
-        ui = {"images": [{"filename": file, "subfolder": subfolder, "type": "output"}],
-              "animated": (True,)}
-        return {"ui": ui, "result": (video, path, report)}
+    from comfy_api.latest import InputImpl
+    video = InputImpl.VideoFromFile(path)
+    ui = {"images": [{"filename": file, "subfolder": subfolder, "type": "output"}],
+          "animated": (True,)}
+    return {"ui": ui, "result": (video, path, report)}
 
 
 def _cut_flags(y, state, gop):

@@ -144,6 +144,24 @@ def decode_streamed(decode, vid, n, slice_t=30, warm_t=5, tail_t=2):
         img = decode(vid).float().cpu()
         return img.reshape(-1, img.shape[-3], img.shape[-2], img.shape[-1])[:n]
     out, at = None, 0
+    for part in decode_slices(decode, vid, n, slice_t, warm_t, tail_t):
+        if out is None:
+            out = torch.empty((n, int(part.shape[1]), int(part.shape[2]), 3), dtype=torch.float32)
+        out[at:at + int(part.shape[0])] = part
+        at += int(part.shape[0])
+    return out[:at]
+
+
+def decode_slices(decode, vid, n, slice_t=30, warm_t=5, tail_t=2):
+    """`decode_streamed`'s slices, yielded as they are decoded ([k, H, W, 3]
+    float32 on the CPU, `n` frames in all) for a consumer that writes them out
+    and lets them go."""
+    tv = int(vid.shape[2])
+    if tv <= slice_t + warm_t:
+        img = decode(vid).float().cpu()
+        yield img.reshape(-1, img.shape[-3], img.shape[-2], img.shape[-1])[:n]
+        return
+    at = 0
     for k0 in range(0, tv, slice_t):
         k1 = min(tv, k0 + slice_t)
         a = max(0, k0 - warm_t)
@@ -154,12 +172,148 @@ def decode_streamed(decode, vid, n, slice_t=30, warm_t=5, tail_t=2):
         keep = min(_tu.frames_in(k1) - _tu.frames_in(k0), n - at)
         if keep <= 0:
             break
-        if out is None:
-            out = torch.empty((n, int(part.shape[1]), int(part.shape[2]), 3), dtype=torch.float32)
-        out[at:at + keep] = part[head:head + keep]
+        yield part[head:head + keep]
         at += keep
         del part
-    return out[:at]
+
+
+# --- the file in, the file out ----------------------------------------------
+#
+# The IMAGE node above is bounded by ComfyUI's IMAGE type: Get Video Components
+# hands it the whole clip as one float32 tensor (stacked from a list, so twice
+# for a moment), it fits and pads a copy, and it hands back the whole result as
+# another -- a minute at 48 fps is ~32 GB in and ~72 GB out at 2 MP. The redraw
+# in between only ever needs the LATENT, which is tiny (a minute is ~100 MB).
+# So the file node reads the video a chunk at a time and encodes as it goes
+# (the H3 VAE encodes every 17 frames on their own, so 102-frame pieces give
+# the very latent the whole clip does), redraws exactly as the IMAGE node does,
+# and decodes slice by slice straight into H3 Save Video's encoder.
+
+READ_FRAMES = 102           # frames read and encoded at a time: 6 VAE clips of 17
+
+
+def _video_file(video):
+    """The VIDEO's file source and trim window when frames can be read from it
+    directly, else None (components, a list, a crop: read whole instead)."""
+    if type(video).__name__ != "VideoFromFile" or not hasattr(video, "get_stream_source"):
+        return None
+    if getattr(video, "_VideoFromFile__crop", None) is not None:
+        return None
+    start, duration = video.get_active_trim_window()
+    return video.get_stream_source(), float(start), float(duration)
+
+
+def read_frames(source, start, duration, k):
+    """[<=k, H, W, 3] float32 batches, 0..1, decoded from the file in order (the
+    trim window and rotation as ComfyUI's own loader applies them)."""
+    import av
+    import numpy as np
+    try:
+        from comfy_api.latest._input_impl.video_types import _rotation_quadrant
+    except Exception:  # noqa: BLE001
+        _rotation_quadrant = None
+    with av.open(source, mode="r") as container:
+        vs = container.streams.video[0]
+        vs.thread_type = "AUTO"
+        start_pts = int(start / vs.time_base)
+        end_pts = int((start + duration) / vs.time_base)
+        if start_pts:
+            container.seek(start_pts, stream=vs)
+        buf, fmt = [], None
+        for frame in container.decode(vs):
+            if frame.pts is not None and frame.pts < start_pts:
+                continue
+            if duration and frame.pts is not None and frame.pts >= end_pts:
+                break
+            if fmt is None:
+                deep = any(int(c.bits) > 8 for c in frame.format.components)
+                fmt = "rgb48le" if deep else "rgb24"
+            img = frame.to_ndarray(format=fmt)
+            img = img.astype(np.float32) / 65535.0 if fmt == "rgb48le" else img
+            q = _rotation_quadrant(frame) if _rotation_quadrant is not None else 0
+            if q:
+                img = np.rot90(img, k=q, axes=(0, 1)).copy()
+            buf.append(torch.from_numpy(img))
+            if len(buf) == k:
+                yield _to_float(torch.stack(buf))
+                buf = []
+        if buf:
+            yield _to_float(torch.stack(buf))
+
+
+def _to_float(x):
+    return x.float().div_(255.0) if x.dtype == torch.uint8 else x
+
+
+def read_audio(source, start, duration):
+    """The file's soundtrack as an AUDIO dict (trimmed like the frames), or None."""
+    import av
+    import numpy as np
+    try:
+        with av.open(source, mode="r") as container:
+            if not container.streams.audio:
+                return None
+            ast = container.streams.audio[-1]
+            sr = int(ast.sample_rate or 0)
+            if sr <= 0:
+                return None
+            resampler = av.audio.resampler.AudioResampler(format="fltp")
+            chunks, t0 = [], None
+            for frame in container.decode(ast):
+                for rf in resampler.resample(frame):
+                    if t0 is None:
+                        t0 = float(rf.pts * rf.time_base) if rf.pts is not None else 0.0
+                    chunks.append(rf.to_ndarray())
+            if not chunks:
+                return None
+            data = np.concatenate(chunks, axis=1)
+            s0 = max(0, int(round((float(start) - (t0 or 0.0)) * sr)))
+            s1 = s0 + int(round(float(duration) * sr)) if duration else data.shape[1]
+            data = np.ascontiguousarray(data[:, s0:s1])
+            return {"waveform": torch.from_numpy(data).unsqueeze(0), "sample_rate": sr}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{TAG}] soundtrack not read ({exc!r}); conditioning on silence", flush=True)
+        return None
+
+
+def encode_video_streamed(vae, batches, seg=READ_FRAMES):
+    """Encode frame batches (`seg` frames each, the last one shorter) as they
+    arrive. -> (video latent of valid_length(n) frames, n, (src_w, src_h)).
+
+    Every piece but the last is a whole number of 17-frame VAE clips, so
+    `encode_steps` gives exactly its share of the whole clip's latent; the last
+    is padded with its final frame to the clip's 17g + 5 length, as the IMAGE
+    node pads the whole clip."""
+    import comfy.model_management as mm
+    from comfy_extras.nodes_minimax_h3 import temporal_shape
+    if seg % 17:
+        raise ValueError(f"{TAG}: read size {seg} is not a whole number of 17-frame clips")
+    it = iter(batches)
+    cur = next(it, None)
+    if cur is None or int(cur.shape[0]) == 0:
+        raise ValueError(f"{TAG}: no frames")
+    src_w, src_h = int(cur.shape[2]), int(cur.shape[1])
+    w, h = grid_size(src_w, src_h)
+    lats, n, steps_done = [], 0, 0
+    while cur is not None:
+        mm.throw_exception_if_processing_interrupted()
+        nxt = next(it, None)
+        frames = fit_frames(cur[..., :3], w, h)
+        before, n = n, n + int(cur.shape[0])
+        if nxt is None:
+            length = valid_length(n)
+            _, latent_t, _ = temporal_shape(length)
+            frames = pad_frames(frames, length - before)
+            lat = _tu.encode_steps(vae.encode, frames, latent_t - steps_done)
+        else:
+            if int(cur.shape[0]) != seg:
+                raise RuntimeError(f"{TAG}: a {int(cur.shape[0])}-frame read before the end")
+            lat = _tu.encode_steps(vae.encode, frames, seg // 17 * 5)
+        lats.append(lat.cpu())
+        steps_done += int(lat.shape[2])
+        del frames, lat
+        cur = nxt
+    return torch.cat(lats, dim=2), n, (src_w, src_h)
 
 
 class HTCVideoUpsampler:
@@ -260,132 +414,236 @@ class HTCVideoUpsampler:
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
             structure_lock=0.0, lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0],
             audio=None, audio_vae=None, conditioning=None, fps=None):
-        import comfy.nested_tensor as nt
-        import comfy.samplers
-        import folder_paths
-        import nodes
-        from comfy_extras.nodes_minimax_h3 import temporal_shape
-
-        _tu.register_folder()
-        _fsm = getattr(vae, "first_stage_model", None)
-        if (_fsm is not None and type(_fsm).__name__ == "MiniMaxH3VideoVAE"
-                and not hasattr(_fsm, "decoder")):
-            raise RuntimeError(
-                f"{TAG}: the wired Video VAE has no decoder (encoder-only, 343 MB — "
-                "e.g. minimax_h3_sol_vae_fp16.safetensors uses decoder.blocks.* keys "
-                "which ComfyUI's stock VAELoader skips). Pick "
-                "minimax_h3_lynnreal_light_vae_int8_convrot.safetensors or "
-                "minimax_h3_video_vae_int8_convrot.safetensors in VAELoader.")
-        r2k_sigmas = _tu.REGEN2K_SIGMAS
+        check_vae(vae)
         n = int(images.shape[0])
         if n < 1:
             raise ValueError(f"{TAG}: no frames")
-        w, h = grid_size(int(images.shape[2]), int(images.shape[1]))
+        src_w, src_h = int(images.shape[2]), int(images.shape[1])
+        w, h = grid_size(src_w, src_h)
         length = valid_length(n)
-        _, latent_t, audio_t = temporal_shape(length)
-
         frames = pad_frames(fit_frames(images, w, h), length)
         video = vae.encode(frames[..., :3])
-        if int(video.shape[2]) != latent_t:
-            raise RuntimeError(f"{TAG}: {length} frames encoded to {int(video.shape[2])} "
-                               f"latent steps, expected {latent_t}")
         del frames
-        clip_fps = float(fps) if fps else float(H3_FPS)
-        off_24 = abs(clip_fps - H3_FPS) > 1e-3
-        mode = str(off_24_audio or OFF_24_AUDIO[0]) if off_24 else "as_is"
-        if off_24:
-            print(f"[{TAG}] WARNING: {clip_fps:g} fps clip; H3 reads every frame as 1/{H3_FPS} s, "
-                  f"so {n} frames span {n / H3_FPS:.1f} s on its clock vs {n / clip_fps:.1f} s "
-                  f"of soundtrack. off_24_audio={mode}.", flush=True)
-        if audio is not None and audio_vae is not None and mode != "silence":
-            import comfy.audio
-            wav = audio["waveform"]
-            vsr = getattr(audio_vae, "audio_sample_rate", 44100)
-            if mode == "retime":
-                wav = retime_audio(wav, int(audio["sample_rate"]), vsr, clip_fps)
-            elif int(audio["sample_rate"]) != vsr:
-                wav = comfy.audio.resample(wav, int(audio["sample_rate"]), vsr)
-            a_lat = fit_audio_latent(audio_vae.encode(wav[:1].movedim(1, -1)), audio_t)
-            audio_note = "conditioned on the soundtrack" + (
-                f" retimed x{clip_fps / H3_FPS:g} ({clip_fps:g} fps)" if mode == "retime"
-                else f" out of sync ({clip_fps:g} fps)" if off_24 else "")
-        elif off_24 and mode == "silence" and audio is not None and audio_vae is not None:
-            a_lat = torch.zeros((1, 32, 2, audio_t), dtype=video.dtype)
-            audio_note = f"conditioned on silence (off_24_audio=silence, {clip_fps:g} fps)"
-        else:
-            a_lat = torch.zeros((1, 32, 2, audio_t), dtype=video.dtype)
-            audio_note = "conditioned on silence (no audio_vae + audio)"
-        latent = {"samples": nt.NestedTensor((video, a_lat.to(video.device, video.dtype)))}
-
-        if conditioning:
-            cond = text_only_cond(conditioning)
-            cond_note = "wired conditioning (text only)"
-        else:
-            cond = zero_out_cond()
-            cond_note = "zeroed-out conditioning"
-        lock = max(0.0, min(1.0, float(structure_lock or 0.0)))
-        lock_sig = max(0.5, float(lock_sigma or _tu.LOCK_SIGMA))
-        model = model.clone() if hasattr(model, "clone") else model
-        eff_lora = str(lora or "").strip()
-        if not eff_lora or eff_lora == "None":
-            eff_lora = None if getattr(model, "patches", None) else REGEN2K_DEFAULT_LORA
-        eff_strength = float(denoise)
-        if eff_strength <= 0.0:
-            lora_tag = "denoise 0 (3D upscale only)"
-        elif eff_lora is None:
-            lora_tag = f"pre-patched ({len(model.patches)} targets)"
-        else:
-            folder_paths.get_full_path_or_raise("loras", eff_lora)
-            model = nodes.LoraLoaderModelOnly().load_lora_model_only(
-                model, eff_lora, eff_strength)[0]
-            lora_tag = f"{eff_lora} @ {eff_strength:g}"
-        # As upsample_chain: port dense LoRA AdaLN patches (pruned DiTs).
-        fix = getattr(nodes, "NODE_CLASS_MAPPINGS", {}).get("H3AdaLNLoRAFix")
-        if fix is not None and hasattr(model, "patches"):
-            try:
-                res = fix.execute(model=model, mode="port")
-                model = (res.args if hasattr(res, "args") else tuple(res))[0]
-            except Exception:
-                pass
-
-        sampler = comfy.samplers.sampler_object(str(sampler_name))
-        sig_list = [round(float(s), 4) for s in r2k_sigmas]
-        print(f"[{TAG}] {n} frames at {int(images.shape[2])}x{int(images.shape[1])} -> H3 "
-              f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}, "
-              f"{cond_note}, structure lock {lock:g} at {lock_sig:g} cells; "
-              f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag}, "
-              f"sigmas {sig_list})", flush=True)
-        _cd = _tu.CHAIN_DEFAULTS
-        overlap_px = int(_cd["tile_overlap_px"])
-        if eff_strength <= 0.0:
-            steps = 0
-            out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
-                               float(megapixels), 0.0, guide=None,
-                               budget=int(tile_tokens), steps=1, start_sigma=0.0,
-                               overlap_px=overlap_px, detail_sigma=0.0)
-        else:
-            steps = len(r2k_sigmas) - 1
-            out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
-                               float(megapixels), 1.0, guide=None,
-                               budget=int(tile_tokens), steps=steps, start_sigma=0.0,
-                               overlap_px=overlap_px, detail_sigma=0.0,
-                               seed=int(redraw_seed), noise="per_chunk",
-                               sigmas=r2k_sigmas, structure_lock=lock, lock_sigma=lock_sig)
-        _tu._free(model)
-        if _tu._device().type == "cuda":
-            _tu._free_all_gpu()
-        img = decode_streamed(vae.decode, out["samples"].tensors[0], n)
-        del out
-        report = (f"{n} frames {int(images.shape[2])}x{int(images.shape[1])} -> "
-                  f"{int(img.shape[2])}x{int(img.shape[1])}"
-                  f", regen2k ({lora_tag}, {steps} steps, {cond_note}"
-                  f", structure lock {lock:g} at {lock_sig:g} cells)"
-                  f", {audio_note}"
-                  f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
-        print(f"[{TAG}] {report}", flush=True)
+        vid, report = redraw(
+            model, video, n, (src_w, src_h), upscale_model, megapixels, denoise, lora,
+            tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
+            audio, audio_vae, conditioning, fps)
+        img = decode_streamed(vae.decode, vid, n)
+        del vid
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
                 report)
 
 
-NODE_CLASS_MAPPINGS = {"H3VideoUpsampler": HTCVideoUpsampler}
-NODE_DISPLAY_NAME_MAPPINGS = {"H3VideoUpsampler": "H3 Video Upsampler"}
+def check_vae(vae):
+    """Fail before any work when the wired Video VAE cannot decode."""
+    _fsm = getattr(vae, "first_stage_model", None)
+    if (_fsm is not None and type(_fsm).__name__ == "MiniMaxH3VideoVAE"
+            and not hasattr(_fsm, "decoder")):
+        raise RuntimeError(
+            f"{TAG}: the wired Video VAE has no decoder (encoder-only, 343 MB — "
+            "e.g. minimax_h3_sol_vae_fp16.safetensors uses decoder.blocks.* keys "
+            "which ComfyUI's stock VAELoader skips). Pick "
+            "minimax_h3_lynnreal_light_vae_int8_convrot.safetensors or "
+            "minimax_h3_video_vae_int8_convrot.safetensors in VAELoader.")
+
+
+def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
+           tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
+           audio, audio_vae, conditioning, fps):
+    """Steps 2-4 for a clip already encoded: `video` is the H3 video latent of
+    `n` frames padded to `valid_length(n)`. -> (upsampled video latent, report)."""
+    import comfy.nested_tensor as nt
+    import comfy.samplers
+    import folder_paths
+    import nodes
+    from comfy_extras.nodes_minimax_h3 import temporal_shape
+
+    _tu.register_folder()
+    r2k_sigmas = _tu.REGEN2K_SIGMAS
+    w, h = int(video.shape[4]) * _tu.SPATIAL, int(video.shape[3]) * _tu.SPATIAL
+    length = valid_length(n)
+    _, latent_t, audio_t = temporal_shape(length)
+    if int(video.shape[2]) != latent_t:
+        raise RuntimeError(f"{TAG}: {length} frames encoded to {int(video.shape[2])} "
+                           f"latent steps, expected {latent_t}")
+    clip_fps = float(fps) if fps else float(H3_FPS)
+    off_24 = abs(clip_fps - H3_FPS) > 1e-3
+    mode = str(off_24_audio or OFF_24_AUDIO[0]) if off_24 else "as_is"
+    if off_24:
+        print(f"[{TAG}] WARNING: {clip_fps:g} fps clip; H3 reads every frame as 1/{H3_FPS} s, "
+              f"so {n} frames span {n / H3_FPS:.1f} s on its clock vs {n / clip_fps:.1f} s "
+              f"of soundtrack. off_24_audio={mode}.", flush=True)
+    if audio is not None and audio_vae is not None and mode != "silence":
+        import comfy.audio
+        wav = audio["waveform"]
+        vsr = getattr(audio_vae, "audio_sample_rate", 44100)
+        if mode == "retime":
+            wav = retime_audio(wav, int(audio["sample_rate"]), vsr, clip_fps)
+        elif int(audio["sample_rate"]) != vsr:
+            wav = comfy.audio.resample(wav, int(audio["sample_rate"]), vsr)
+        a_lat = fit_audio_latent(audio_vae.encode(wav[:1].movedim(1, -1)), audio_t)
+        audio_note = "conditioned on the soundtrack" + (
+            f" retimed x{clip_fps / H3_FPS:g} ({clip_fps:g} fps)" if mode == "retime"
+            else f" out of sync ({clip_fps:g} fps)" if off_24 else "")
+    elif off_24 and mode == "silence" and audio is not None and audio_vae is not None:
+        a_lat = torch.zeros((1, 32, 2, audio_t), dtype=video.dtype)
+        audio_note = f"conditioned on silence (off_24_audio=silence, {clip_fps:g} fps)"
+    else:
+        a_lat = torch.zeros((1, 32, 2, audio_t), dtype=video.dtype)
+        audio_note = "conditioned on silence (no audio_vae + audio)"
+    latent = {"samples": nt.NestedTensor((video, a_lat.to(video.device, video.dtype)))}
+
+    if conditioning:
+        cond = text_only_cond(conditioning)
+        cond_note = "wired conditioning (text only)"
+    else:
+        cond = zero_out_cond()
+        cond_note = "zeroed-out conditioning"
+    lock = max(0.0, min(1.0, float(structure_lock or 0.0)))
+    lock_sig = max(0.5, float(lock_sigma or _tu.LOCK_SIGMA))
+    model = model.clone() if hasattr(model, "clone") else model
+    eff_lora = str(lora or "").strip()
+    if not eff_lora or eff_lora == "None":
+        eff_lora = None if getattr(model, "patches", None) else REGEN2K_DEFAULT_LORA
+    eff_strength = float(denoise)
+    if eff_strength <= 0.0:
+        lora_tag = "denoise 0 (3D upscale only)"
+    elif eff_lora is None:
+        lora_tag = f"pre-patched ({len(model.patches)} targets)"
+    else:
+        folder_paths.get_full_path_or_raise("loras", eff_lora)
+        model = nodes.LoraLoaderModelOnly().load_lora_model_only(
+            model, eff_lora, eff_strength)[0]
+        lora_tag = f"{eff_lora} @ {eff_strength:g}"
+    # As upsample_chain: port dense LoRA AdaLN patches (pruned DiTs).
+    fix = getattr(nodes, "NODE_CLASS_MAPPINGS", {}).get("H3AdaLNLoRAFix")
+    if fix is not None and hasattr(model, "patches"):
+        try:
+            res = fix.execute(model=model, mode="port")
+            model = (res.args if hasattr(res, "args") else tuple(res))[0]
+        except Exception:
+            pass
+
+    sampler = comfy.samplers.sampler_object(str(sampler_name))
+    sig_list = [round(float(s), 4) for s in r2k_sigmas]
+    print(f"[{TAG}] {n} frames at {src_size[0]}x{src_size[1]} -> H3 "
+          f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}, "
+          f"{cond_note}, structure lock {lock:g} at {lock_sig:g} cells; "
+          f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag}, "
+          f"sigmas {sig_list})", flush=True)
+    _cd = _tu.CHAIN_DEFAULTS
+    overlap_px = int(_cd["tile_overlap_px"])
+    if eff_strength <= 0.0:
+        steps = 0
+        out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
+                           float(megapixels), 0.0, guide=None,
+                           budget=int(tile_tokens), steps=1, start_sigma=0.0,
+                           overlap_px=overlap_px, detail_sigma=0.0)
+    else:
+        steps = len(r2k_sigmas) - 1
+        out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
+                           float(megapixels), 1.0, guide=None,
+                           budget=int(tile_tokens), steps=steps, start_sigma=0.0,
+                           overlap_px=overlap_px, detail_sigma=0.0,
+                           seed=int(redraw_seed), noise="per_chunk",
+                           sigmas=r2k_sigmas, structure_lock=lock, lock_sigma=lock_sig)
+    _tu._free(model)
+    if _tu._device().type == "cuda":
+        _tu._free_all_gpu()
+    vid = out["samples"].tensors[0]
+    del out
+    report = (f"{n} frames {src_size[0]}x{src_size[1]} -> "
+              f"{int(vid.shape[4]) * _tu.SPATIAL}x{int(vid.shape[3]) * _tu.SPATIAL}"
+              f", regen2k ({lora_tag}, {steps} steps, {cond_note}"
+              f", structure lock {lock:g} at {lock_sig:g} cells)"
+              f", {audio_note}"
+              f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
+    print(f"[{TAG}] {report}", flush=True)
+    return vid, report
+
+
+
+class HTCVideoUpsamplerToFile:
+    """The upsampler from a video file to an MP4, never holding the film's frames."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        base = HTCVideoUpsampler.INPUT_TYPES()
+        req = {"video": ("VIDEO", {"tooltip": (
+            "The clip (Load Video). Read and encoded a chunk at a time; its frame rate and "
+            "soundtrack come from the file.")})}
+        for k, v in base["required"].items():
+            if k != "images":
+                req[k] = v
+        try:
+            from .save_video import CPU_CODECS, FRAME_GEN, QUALITY
+            req["frame_gen"] = (list(FRAME_GEN), {"default": "off", "tooltip": (
+                "RTX frame generation while saving: x2 turns 24 fps into 48 (RTX card + "
+                "nvidia-vfx).")})
+            req["codec"] = (["auto"] + list(CPU_CODECS), {"default": "auto"})
+            req["quality"] = (list(QUALITY), {"default": "max"})
+        except Exception:  # noqa: BLE001 -- PyAV missing: the node fails at run time
+            pass
+        req["filename_prefix"] = ("STRING", {"default": "video/H3_upsampled"})
+        opt = {k: v for k, v in base["optional"].items()
+               if k in ("audio_vae", "conditioning")}
+        return {"required": req, "optional": opt,
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
+
+    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
+    RETURN_NAMES = ("video", "filepath", "report")
+    FUNCTION = "run"
+    CATEGORY = "video/upscale"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "H3 Video Upsampler from a video file straight to an MP4: the clip is read, "
+        "encoded, re-drawn, decoded and saved a chunk at a time, so RAM stays flat however "
+        "long the film is. Same re-draw as the IMAGE node; the frame rate and soundtrack "
+        "come from the file.")
+
+    def run(self, video, model, vae, upscale_model, megapixels, denoise, lora, tile_tokens,
+            sampler_name, redraw_seed=REGEN2K_SEED, structure_lock=0.0,
+            lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0], frame_gen="off",
+            codec="auto", quality="max", filename_prefix="video/H3_upsampled",
+            audio_vae=None, conditioning=None, prompt=None, extra_pnginfo=None):
+        import time
+        from . import save_video as _sv
+
+        check_vae(vae)
+        t0 = time.perf_counter()
+        src = _video_file(video)
+        if src is not None:
+            fps = float(video.get_frame_rate())
+            source, start, duration = src
+            audio = read_audio(source, start, duration)
+            batches = read_frames(video.get_stream_source(), start, duration, READ_FRAMES)
+            how = "read from the file a chunk at a time"
+        else:
+            comp = video.get_components()
+            audio, imgs = comp.audio, comp.images
+            fps = float(comp.frame_rate)
+            batches = (imgs[s:s + READ_FRAMES] for s in range(0, int(imgs.shape[0]), READ_FRAMES))
+            how = "not a plain file (components, list or crop): decoded whole"
+        lat, n, src_size = encode_video_streamed(vae, batches)
+        t1 = time.perf_counter()
+        print(f"[{TAG}] {n} frames at {fps:g} fps {how}, encoded in {t1 - t0:.1f} s "
+              f"({int(lat.shape[2])} latent steps, {lat.numel() * lat.element_size() / 1048576.0:.0f} MB)",
+              flush=True)
+        vid, report = redraw(
+            model, lat, n, src_size, upscale_model, megapixels, denoise, lora,
+            tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
+            audio, audio_vae, conditioning, fps)
+        del lat
+        out_w, out_h = int(vid.shape[4]) * _tu.SPATIAL, int(vid.shape[3]) * _tu.SPATIAL
+        res = _sv.encode_stream(decode_slices(vae.decode, vid, n), n, out_w, out_h, fps,
+                                frame_gen, codec, quality, filename_prefix, audio,
+                                prompt, extra_pnginfo)
+        _video, path, save_report = res["result"]
+        report = f"{report}; {save_report}; total {time.perf_counter() - t0:.0f} s"
+        print(f"[{TAG}] {report}", flush=True)
+        return {"ui": res["ui"], "result": (_video, path, report)}
+
+NODE_CLASS_MAPPINGS = {"H3VideoUpsampler": HTCVideoUpsampler,
+                       "H3VideoUpsamplerToFile": HTCVideoUpsamplerToFile}
+NODE_DISPLAY_NAME_MAPPINGS = {"H3VideoUpsampler": "H3 Video Upsampler",
+                              "H3VideoUpsamplerToFile": "H3 Video Upsampler (file to file)"}
