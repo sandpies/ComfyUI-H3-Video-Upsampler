@@ -489,10 +489,13 @@ class HTCVideoUpsampler:
                     "tooltip": ("Open-H3-Regenerate-2K LoRA from models/loras "
                                 f"(default: {REGEN2K_DEFAULT_LORA}).")}),
                 "tile_tokens": ("INT", {
-                    "default": _tu.TOKEN_BUDGET, "min": 8192, "max": 1048576, "step": 1024,
-                    "tooltip": ("Largest sequence one tile forward may carry. Lower = shorter "
-                                "chunks (down to 68 f) then more, smaller tiles: less VRAM, "
-                                f"slower. {_tu.TOKEN_BUDGET} is the default.")}),
+                    "default": 0, "min": 0, "max": 1048576, "step": 1024,
+                    "tooltip": ("VRAM. 0 = auto: starts at what this GPU learned last time "
+                                f"({_tu.TOKEN_BUDGET} the first time), measures every chunk, and "
+                                "stores where the next run should start -- grown when there was "
+                                "room, lowered for good after running out. A number = that "
+                                "fixed budget: the largest sequence one forward may carry; lower "
+                                "means shorter chunks (down to 68 f) then tiles.")}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
                 # Not named seed: ComfyUI hangs a randomize control on any
                 # widget called seed, and the default 42 should stay fixed.
@@ -679,7 +682,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
     print(f"[{TAG}] {n} frames at {src_size[0]}x{src_size[1]} -> H3 "
           f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}, "
           f"{cond_note}, structure lock {lock:g} at {lock_sig:g} cells; "
-          f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag}, "
+          f"tile budget {int(tile_tokens) or 'auto'}; regen2k ({lora_tag}, "
           f"sigmas {sig_list})", flush=True)
     _cd = _tu.CHAIN_DEFAULTS
     overlap_px = int(_cd["tile_overlap_px"])
@@ -712,7 +715,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
               f", {audio_note}, attention {attention}, chunk_join {chunk_join}"
               f", chunking {'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}"
               f", lock anchor {lock_anchor}"
-              f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
+              f", tile budget {int(tile_tokens) or 'auto'}, overlap {overlap_px}px")
     print(f"[{TAG}] {report}", flush=True)
     return vid, report
 

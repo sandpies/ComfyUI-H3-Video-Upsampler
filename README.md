@@ -27,7 +27,7 @@ Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 | `megapixels` | output size, aspect kept (2 = about 1920x1080) |
 | `denoise` | **0.8** is the default Regen2K LoRA strength (3 Euler steps on `[0.8, 24/35, 0.48, 0]`); 0 skips the re-draw and only enlarges |
 | `lora` | Open-H3-Regenerate-2K LoRA from `models/loras` (`open_h3_regenerate_2k_r256pp_bf16.safetensors` by default) |
-| `tile_tokens` | **VRAM.** Largest sequence per tile; lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
+| `tile_tokens` | **VRAM. 0 = auto (default):** starts at what this GPU learned last time (70000 the first time), measures every chunk's real activation memory, and stores where the next run should start. It grows when there was room (at most 2x a run, aiming at 85% of the card) and drops to the budget that worked after running out of VRAM, never going back near the failing value. Learned per GPU, attention mode and low-VRAM settings, in `ComfyUI/user/htc_upsampler_memory.json`. A number fixes the budget: lower = shorter chunks (down to 68 f), then tiles |
 | `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |
 | `structure_lock` | **0 = off.** Holds the re-draw's large shapes (faces, hands, line work) to the clip's at every step, so chunks and tiles stop inventing and agree where they overlap; fine detail still comes from the re-draw. Try 0.5-1, higher for animation |
 | `lock_sigma` | What `structure_lock` counts as large, in latent cells (16 px each; 2 = 32 px). 1-1.5 also holds eyes and mouths on medium shots, with a little less sharpening |

@@ -65,6 +65,7 @@ UPSCALER_DTYPE = torch.float16
 _FLUSH_S = [0.0]           # seconds spent in sample_tile's cache flush (log only)
 _LAST_OOM = [0]            # OOM retries in the most recent redraw_chunk call (log only)
 _LAST_BUDGET = [TOKEN_BUDGET]  # budget redraw_chunk / upsample finished at
+_LAST_TOKENS = [0]          # tokens per forward of the last redraw_chunk grid (incl. cond rows)
 
 
 class _DefaultInt(int):
@@ -965,6 +966,121 @@ def recipe_sigmas(model, denoise=DENOISE, steps=STEPS, start_sigma=0.0):
     return sig[-(steps + 1):]
 
 
+# --- the memory plan: tile_tokens = 0 learns this machine ---------------------
+#
+# A fixed token budget is a guess about someone else's card. With tile_tokens 0
+# the upsampler starts from what it learned on THIS GPU last time (70000 the
+# first time), measures every chunk -- activation memory = peak minus what is
+# still resident after the chunk (mostly weights, which ComfyUI's dynamic
+# loading grows into any spare VRAM, so the raw peak says little) -- and stores
+# the budget the next run should start at: grown, at most 2x a run, toward
+# 85% of the card when there was room; after an OOM, the budget that worked,
+# and never again up to the one that failed. Keyed by GPU, its memory, the
+# attention mode and the low-VRAM chunking, which all change the cost of a token.
+
+MEMORY_FILE = "htc_upsampler_memory.json"
+MEMORY_HEADROOM = 0.85
+MEMORY_GROWTH = 2.0
+
+
+def memory_key(attention="dense", attn_chunks=4, ffn_chunks=2, factor=1):
+    """This machine's key for the memory plan, or None off CUDA."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        props = torch.cuda.get_device_properties(_device())
+    except Exception:  # noqa: BLE001
+        return None
+    gb = round(props.total_memory / 2 ** 30)
+    return f"{props.name}|{gb}GB|{attention}|a{int(attn_chunks)}f{int(ffn_chunks)}|g{int(factor)}"
+
+
+def _memory_path():
+    import folder_paths
+    try:
+        d = folder_paths.get_user_directory()
+    except Exception:  # noqa: BLE001
+        d = folder_paths.get_temp_directory()
+    return os.path.join(d, MEMORY_FILE)
+
+
+def _memory_load():
+    import json
+    try:
+        with open(_memory_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def resolve_budget(budget, key):
+    """`budget` as given, or (0) what this machine learned. -> (budget, auto, note)."""
+    if int(budget or 0) > 0:
+        return int(budget), False, f"{int(budget)} (fixed)"
+    entry = _memory_load().get(key) if key else None
+    if entry and int(entry.get("budget", 0)) > 0:
+        return int(entry["budget"]), True, (f"{int(entry['budget'])} (auto, learned over "
+                                            f"{int(entry.get('runs', 1))} run(s))")
+    return TOKEN_BUDGET, True, f"{TOKEN_BUDGET} (auto, first run on this machine)"
+
+
+def next_budget(used, final, samples, total_bytes, oom_at=None):
+    """Where the next run starts. -> (budget, oom_at).
+
+    `used` is the budget this run started at, `final` where it finished (lower
+    after an OOM retry). `samples` are (tokens per forward, activation bytes,
+    resident bytes) of chunks that ran without an OOM."""
+    used, final = int(used), int(final)
+    if final < used:                        # ran out: start where it worked
+        oom_at = min(int(oom_at), used) if oom_at else used
+        return max(1024, final // 1024 * 1024), oom_at
+    fit = None
+    for tokens, act, resident in samples:
+        if tokens <= 0 or act <= 0:
+            continue
+        room = MEMORY_HEADROOM * float(total_bytes) - float(resident)
+        if room <= 0:
+            continue
+        f = int(tokens * room / float(act))
+        fit = f if fit is None else min(fit, f)
+    nb = used
+    if fit is not None and fit > used:          # grow, never past 2x a run
+        nb = max(used, min(fit, int(used * MEMORY_GROWTH)) // 1024 * 1024)
+    if oom_at and nb > int(int(oom_at) * 0.9):  # and never back near a failure
+        nb = max(1024, min(used, int(int(oom_at) * 0.9) // 1024 * 1024))
+    return nb, oom_at
+
+
+def record_budget(key, used, final, samples):
+    """Store what this run learned for `key`. -> a note for the log."""
+    import json
+    import time as _time
+    if not key:
+        return ""
+    data = _memory_load()
+    entry = data.get(key) or {}
+    total = torch.cuda.get_device_properties(_device()).total_memory
+    nb, oom_at = next_budget(used, final, samples, total, entry.get("oom_at"))
+    entry.update(budget=int(nb), oom_at=oom_at, runs=int(entry.get("runs", 0)) + 1,
+                 updated=_time.strftime("%Y-%m-%d %H:%M:%S"))
+    if samples:
+        t, a, r = max(samples, key=lambda x: x[0])
+        entry["last"] = {"tokens": int(t), "activation_mb": round(a / 2 ** 20),
+                         "resident_mb": round(r / 2 ** 20)}
+    data[key] = entry
+    try:
+        path = _memory_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+    except OSError as exc:
+        return f"not stored ({exc!r})"
+    return (f"next run starts at {nb}" + (" (ran out of memory at "
+                                          f"{oom_at})" if oom_at else ""))
+
+
 def apply_sparse_attention(model):
     """ComfyUI's Model Sparse Attention (sol-attn, its defaults) on every step
     of the re-draw. -> (model, note). Kijai's low-VRAM attention composes with
@@ -1216,6 +1332,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  for (r0, c0, rows, cols, *_rest) in prepared]
         tokens = (seq_len(grid[2], grid[3], t) if int(factor) <= 1
                   else f"{guided_seq_len(grid[2], grid[3], t, factor)} (guide incl.)")
+        _LAST_TOKENS[0] = factor_seq_len(grid[2], grid[3], t, factor) + extra
         _sig_s = [round(float(s), 4) for s in sigmas]
         print(f"[{TAG}] chunk {w * SPATIAL}x{h * SPATIAL}px x {t} latent steps: "
               f"{grid[0]}x{grid[1]} tiles of {grid[2]}x{grid[3]}px, overlap "
@@ -1476,6 +1593,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     attn_note = "dense"
     if str(attention) == "sparse":
         model, attn_note = apply_sparse_attention(model)
+    mem_key = memory_key(attention, attn_chunks, ffn_chunks, factor)
+    budget, auto_budget, budget_note = resolve_budget(budget, mem_key)
     is_regen2k = sigmas is not None
     chunking, tiling = bool(chunking), bool(tiling)
     whole = not chunking
@@ -1512,7 +1631,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              else "no re-draw (denoise 0)")
           + (f", h3upscale guide at {w_px // factor}x{h_px // factor}"
              if guide is not None and sigmas is not None else "")
-          + f", attention {attn_note}, chunk_join {chunk_join}, chunking "
+          + f", tile_tokens {budget_note}, attention {attn_note}, chunk_join {chunk_join}, chunking "
           f"{'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}, lock anchor "
           f"{lock_anchor}", flush=True)
 
@@ -1573,6 +1692,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     _redraw_s = _join_s = 0.0
     _oom_total = 0
     init_budget = cur_budget = int(budget)
+    mem_samples, _peak_all = [], 0
     for i, (k0, f0, k1, f1) in enumerate(plan):
         a0, a1 = audio_span(f0, f1)
         cv = upscaled_cvs[i]
@@ -1616,6 +1736,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
             if _ks > 0:
                 known = (_ks, out_v[:, :, k0:k0 + _ks])
         _tr = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         _rc = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, int(seed), factor,
                            cur_budget, overlap_px, detail_sigma=detail_sigma,
                            noise_video=(None if film_nv is None
@@ -1625,6 +1747,11 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         rv, cur_budget = (_rc if isinstance(_rc, tuple) else (_rc, cur_budget))
         _redraw_s += time.perf_counter() - _tr
         _oom_total += _LAST_OOM[0]
+        if torch.cuda.is_available():
+            _pk, _res = torch.cuda.max_memory_allocated(), torch.cuda.memory_allocated()
+            _peak_all = max(_peak_all, _pk)
+            if _LAST_OOM[0] == 0:
+                mem_samples.append((int(_LAST_TOKENS[0]), int(_pk - _res), int(_res)))
         if i == 0:
             _, _g0 = tile_grid(int(cv.shape[3]), int(cv.shape[4]), int(cv.shape[2]),
                                factor, cur_budget, overlap_px)
@@ -1634,8 +1761,9 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                       if torch.cuda.is_available() else "0 MB")
             print(f"[{TAG}] chunk 1: peak VRAM {_vram0}, {_tok0} tokens/forward, "
                   f"budget {cur_budget}"
-                  + (f"; set upsample_tile_tokens to {cur_budget} to skip the OOM next run"
-                     if cur_budget < init_budget else ""),
+                  + ((" (auto: the next run starts there)" if auto_budget else
+                      f"; set upsample_tile_tokens to {cur_budget} (or 0 = auto) to skip "
+                      "the OOM next run") if cur_budget < init_budget else ""),
                   flush=True)
         _tj = time.perf_counter()
         end_v, end_a = _join_into(out_v, out_a, end_v, end_a, rv, ca, k0, f0)
@@ -1647,7 +1775,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     if end_a < out_a.shape[-1]:
         out_a = out_a[..., :end_a]
     assert end_v == int(tv) and end_a == int(total_a), (end_v, tv, end_a, total_a)
-    _peak_mb = torch.cuda.max_memory_allocated() / 1048576.0 if torch.cuda.is_available() else 0.0
+    _peak_mb = _peak_all / 1048576.0
     _lat_mb = (out_v.numel() * out_v.element_size()
                + out_a.numel() * out_a.element_size()) / 1048576.0
     _free(model)
@@ -1658,6 +1786,10 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
           f"joined latent {_lat_mb:.1f} MB"
           + (f", peak VRAM {_peak_mb:.0f} MB" if torch.cuda.is_available() else "")
           + ")", flush=True)
+    if auto_budget and sigmas is not None:
+        note = record_budget(mem_key, init_budget, cur_budget, mem_samples)
+        if note:
+            print(f"[{TAG}] auto tile_tokens: started at {init_budget}, {note}", flush=True)
     return {"samples": nt.NestedTensor((out_v, out_a))}
 
 
