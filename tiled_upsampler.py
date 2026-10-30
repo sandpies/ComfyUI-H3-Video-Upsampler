@@ -104,15 +104,15 @@ LOCK_SIGMA = 2.0
 #   tile_tokens; neither forces one. chunking cuts time into 102-frame chunks
 #   (no shorter than 68 -- Regen2K's 3 steps from 0.8 invent on short pieces);
 #   tiling cuts space. Time is cut before space: a tile sees part of the frame,
-#   which is where invention comes from, while a join in time is held together
-#   by chunk_join=continue and structure_lock. Both off = the whole clip in one
-#   whole-frame pass.
+#   which is where invention comes from, while a join in time can be stepped
+#   together (chunk_join=stepped). Both off = the whole clip in one whole-frame
+#   pass.
 # lock_anchor: what structure_lock holds the large shapes to. source = the
 #   clip's own latent, enlarged by plain interpolation (nothing invented, so
 #   errors the 3D upscaler adds -- a blown patch, a colour shift -- are pulled
 #   back too); upscaler = the 3D upscaler's output.
 ATTENTION_MODES = ("dense", "sparse")
-JOIN_MODES = ("crossfade", "continue")
+JOIN_MODES = ("crossfade", "stepped")
 LOCK_ANCHORS = ("source", "upscaler")
 # tile_context (draft): what a tile knows about the rest of its frame. none =
 #   only its own window (and structure_lock's anchor). global pass = before the
@@ -1145,15 +1145,12 @@ def _apply_low_vram_patches(model, attn_chunks=4, ffn_chunks=2):
     return model
 
 
-def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=None,
-                known_steps=0):
+def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=None):
     """One tile through `sigmas`, audio frozen. -> the tile's video latent.
 
     `noise` is a (video, audio) pair to use as is. SamplerCustomAdvanced's
     path, with a positive-only guider at cfg 1 and the x0 preview. `lock` is
-    a `structure_lock_fn` for this tile, or None. The first `known_steps`
-    latent steps of `video` are held as given (the sampler keeps them at
-    every sigma) and the rest is drawn after them.
+    a `structure_lock_fn` for this tile, or None.
     """
     import comfy.model_management as mm
     import comfy.nested_tensor as nt
@@ -1164,13 +1161,9 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=No
 
     samples = comfy.sample.fix_empty_latent_channels(
         model, nt.NestedTensor((video, audio)), None, None)
-    vmask = torch.ones((1, 1, int(video.shape[2]) if known_steps else 1,
-                        video.shape[3], video.shape[4]),
-                       device=video.device, dtype=torch.float32)
-    if known_steps:
-        vmask[:, :, :int(known_steps)] = 0.0
     mask = nt.NestedTensor((
-        vmask,
+        torch.ones((1, 1, 1, video.shape[3], video.shape[4]),
+                   device=video.device, dtype=torch.float32),
         torch.zeros((1, 32, 2, audio.shape[-1]),
                     device=audio.device, dtype=audio.dtype)))
     guider = comfy.samplers.CFGGuider(model)
@@ -1350,7 +1343,7 @@ def global_pass(model, cond, sampler, sigmas, video, audio, seed, budget,
 def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
                  detail_sigma=0.0, noise_video=None, structure_lock=STRUCTURE_LOCK,
-                 lock_sigma=LOCK_SIGMA, known=None, anchor=None, allow_tiles=True,
+                 lock_sigma=LOCK_SIGMA, anchor=None, allow_tiles=True,
                  tile_context="none"):
     """Every tile stepped together, merged under the feather after each step.
 
@@ -1361,10 +1354,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     so low-frequency tile-grid shifts are stripped while fine detail is kept.
     `structure_lock` > 0 holds every tile's large shapes to its slice of
     `video` (the upscaled source) at every step; see `structure_lock_fn`.
-    `known` = (steps, latent) continues the chunk from frames already drawn:
-    its first `steps` latent steps are held to `latent` and the rest is drawn
-    after them. Whole-frame chunks only; a tiled chunk ignores it (the
-    caller's crossfade then joins it as before). `anchor` replaces `video`
+    `anchor` replaces `video`
     as what structure_lock holds the large shapes to. `allow_tiles` False
     keeps the chunk whole-frame whatever the budget, and an OOM is an error
     instead of a retry in tiles. `tile_context` "global pass" re-draws the
@@ -1434,22 +1424,13 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                 # DynamicVRAM DiT on every step.
                 r0, c0, rows, cols, tcond, _m = prepared[0]
                 xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
-                ks = 0
-                if known is not None and int(known[0]) > 0:
-                    ks = min(int(known[0]), t - 1)
-                    xt = xt.clone()     # a whole-frame slice may be `video` itself
-                    xt[:, :, :ks] = known[1][:, :, :ks].to(xt.device, xt.dtype)
                 noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
                 ot = sample_tile(model, tcond, sampler, sigmas, xt, audio, noise, seed,
-                                 lock=locks[0], known_steps=ks)
+                                 lock=locks[0])
                 _calls += 1
                 x = ot.to(device=dev, dtype=dt)
                 del ot, xt
             else:
-                if known is not None and int(known[0]) > 0:
-                    print(f"[{TAG}] chunk_join=continue needs a whole-frame chunk; this one is "
-                          f"{grid[0]}x{grid[1]} tiles, so it is crossfaded", flush=True)
-                    known = None
                 if str(tile_context) == "global pass":
                     g, g_note = global_pass(
                         model, cond, sampler, sigmas, video, audio, seed,
@@ -1516,11 +1497,76 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
 
     if float(detail_sigma or 0.0) > 0.0:
         x = _highpass_detail_merge(video, x, sigma=float(detail_sigma))
-    if known is not None and int(known[0]) > 0:
-        ks = min(int(known[0]), t - 1)
-        x[:, :, :ks] = known[1][:, :, :ks].to(x.device, x.dtype)
     _LAST_BUDGET[0] = cur_budget
     return x, cur_budget
+
+
+def _step_weights(plan, i, device):
+    """Chunk i's weight per latent step in a stepped merge: 1 inside, ramping
+    linearly to near 0 across the steps it shares with each neighbour, so the
+    end of a chunk -- where it is weakest -- counts least."""
+    k0, _f0, k1, _f1 = plan[i]
+    w = torch.ones(k1 - k0, dtype=torch.float32, device=device)
+    if i > 0:
+        ov = max(0, plan[i - 1][2] - k0)
+        if ov:
+            w[:ov] = torch.arange(1, ov + 1, dtype=torch.float32, device=device) / (ov + 1)
+    if i + 1 < len(plan):
+        ov = max(0, k1 - plan[i + 1][0])
+        if ov:
+            w[-ov:] = torch.minimum(w[-ov:], torch.arange(ov, 0, -1, dtype=torch.float32,
+                                                          device=device) / (ov + 1))
+    return w.view(1, 1, -1, 1, 1)
+
+
+def redraw_stepped(model, plan, videos, audios, conds, sampler, sigmas, seed,
+                   locks=None, mem_samples=None):
+    """Every chunk stepped TOGETHER (chunk_join=stepped). -> the film's video latent.
+
+    `videos` are the chunks' upscaled latents (plan order), `audios` their
+    audio slices, `conds` their conditioning, `locks` their structure locks.
+    The film starts as the chunks crossfaded into one latent; each sigma step
+    runs every chunk from its slice of that one state (the first step with its
+    slice of one film-wide noise field) and merges the results under
+    `_step_weights` before the next step -- what spatial tiles have always
+    done, along time. Whole-frame chunks only (the caller checks)."""
+    c, h, w = int(videos[0].shape[1]), int(videos[0].shape[3]), int(videos[0].shape[4])
+    tv = int(plan[-1][2])
+    dev, dt = videos[0].device, videos[0].dtype
+    film = torch.zeros((1, c, tv, h, w), dtype=dt, device=dev)
+    dummy = torch.zeros((1, 32, 2, 1), dtype=dt, device=dev)
+    end = 0
+    for (k0, f0, k1, _f1), v in zip(plan, videos):
+        end, _ = _join_into(film, dummy, end, 0, v.to(dev, dt), dummy[..., :0], k0, f0)
+    nv = torch.randn((1, c, tv, h, w), generator=torch.Generator().manual_seed(int(seed)),
+                     dtype=torch.float32, device="cpu").to(dev, dt)
+    weights = [_step_weights(plan, i, dev) for i in range(len(plan))]
+    x = film
+    for step in range(len(sigmas) - 1):
+        two = sigmas[step:step + 2]
+        acc = torch.zeros_like(x, dtype=torch.float32)
+        wsum = torch.zeros((1, 1, tv, 1, 1), dtype=torch.float32, device=dev)
+        for i, (k0, _f0, k1, _f1) in enumerate(plan):
+            import comfy.model_management as mm
+            mm.throw_exception_if_processing_interrupted()
+            xt = x[:, :, k0:k1].contiguous()
+            noise = ((nv[:, :, k0:k1].contiguous() if step == 0 else torch.zeros_like(xt)),
+                     torch.zeros_like(audios[i]))
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            ot = sample_tile(model, conds[i], sampler, two, xt, audios[i], noise, seed,
+                             lock=(locks[i] if locks else None))
+            if mem_samples is not None and torch.cuda.is_available():
+                mem_samples.append((seq_len(w * SPATIAL, h * SPATIAL, k1 - k0),
+                                    int(torch.cuda.max_memory_allocated()
+                                        - torch.cuda.memory_allocated()),
+                                    int(torch.cuda.memory_allocated())))
+            acc[:, :, k0:k1] += ot.to(device=dev, dtype=torch.float32) * weights[i]
+            wsum[:, :, k0:k1] += weights[i]
+            del ot, xt
+        x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
+        del acc
+    return x
 
 
 def _crossfade(a, b, dim):
@@ -1783,7 +1829,49 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     _oom_total = 0
     init_budget = cur_budget = int(budget)
     mem_samples, _peak_all = [], 0
-    for i, (k0, f0, k1, f1) in enumerate(plan):
+    stepped = False
+    if str(chunk_join) == "stepped" and sigmas is not None and len(plan) > 1:
+        shape = upscaled_cvs[0].shape
+        fits = all(tile_grid(int(shape[3]), int(shape[4]), int(k1 - k0), factor,
+                             max(4096, int(budget)), overlap_px)[1][:2] == (1, 1)
+                   for (k0, _f0, k1, _f1) in plan) if tiling else True
+        if factor > 1 or not fits:
+            print(f"[{TAG}] chunk_join=stepped needs whole-frame chunks"
+                  + (" (and no h3upscale guide)" if factor > 1 else "")
+                  + "; crossfading instead", flush=True)
+        else:
+            conds, auds, locks = [], [], []
+            for i, (k0, f0, k1, f1) in enumerate(plan):
+                a0, a1 = audio_span(f0, f1)
+                auds.append(audio[:, :, :, a0:min(a1, ta)].contiguous())
+                cv = upscaled_cvs[i]
+                conds.append(cond_for_chunk(clean_refs(conditioning(f0, f1)) if per_chunk
+                                            else cond, f0, f1, cv.shape[3], cv.shape[4]))
+                locks.append(structure_lock_fn(anchors[i] if anchors[i] is not None else cv,
+                                               structure_lock, lock_sigma)
+                             if float(structure_lock) > 0.0 else None)
+            _tr = time.perf_counter()
+            try:
+                out_v = redraw_stepped(model, plan, upscaled_cvs, auds, conds, sampler,
+                                       sigmas, seed, locks, mem_samples)
+                stepped = True
+            except Exception as exc:
+                if not _is_oom(exc):
+                    raise
+                print(f"[{TAG}] chunk_join=stepped ran out of VRAM ({exc}); crossfading "
+                      "chunk by chunk instead", flush=True)
+                _free_all_gpu()
+                mem_samples.clear()
+            _redraw_s += time.perf_counter() - _tr
+            if stepped:
+                print(f"[{TAG}] chunk_join=stepped: {len(plan)} chunks x {len(sigmas) - 1} "
+                      f"steps in {len(plan) * (len(sigmas) - 1)} sampler calls, "
+                      f"{_redraw_s:.1f} s", flush=True)
+                if torch.cuda.is_available() and mem_samples:
+                    _peak_all = max(a + r for _t, a, r in mem_samples)
+                out_a[...] = audio[..., :int(total_a)]
+                end_v, end_a = int(tv), int(total_a)
+    for i, (k0, f0, k1, f1) in enumerate(plan if not stepped else []):
         a0, a1 = audio_span(f0, f1)
         cv = upscaled_cvs[i]
         upscaled_cvs[i] = None
@@ -1818,13 +1906,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                 print(f"[{TAG}] chunk {i + 1}/{len(plan)}: keeping lowered budget "
                       f"{cur_budget} ({_gc[0]}x{_gc[1]} tiles; would fit "
                       f"{_gi[0]}x{_gi[1]} at {init_budget})", flush=True)
-        anchor = anchors[i]
+        lock_anchor_t = anchors[i]      # not `anchor`: that is the pin strength above
         anchors[i] = None
-        known = None
-        if str(chunk_join) == "continue" and i > 0 and end_v > k0:
-            _ks = min(end_v - k0, int(cv.shape[2]) - 1)
-            if _ks > 0:
-                known = (_ks, out_v[:, :, k0:k0 + _ks])
         _tr = time.perf_counter()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
@@ -1833,7 +1916,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                            noise_video=(None if film_nv is None
                                         else film_nv[:, :, k0:k1]),
                            structure_lock=structure_lock, lock_sigma=lock_sigma,
-                           known=known, anchor=anchor, allow_tiles=tiling,
+                           anchor=lock_anchor_t, allow_tiles=tiling,
                            tile_context=tile_context)
         rv, cur_budget = (_rc if isinstance(_rc, tuple) else (_rc, cur_budget))
         _redraw_s += time.perf_counter() - _tr
@@ -2171,11 +2254,13 @@ SETTINGS_TYPE = "HTC_UPSAMPLE"
 ATTENTION_TIP = ("dense = exact attention. sparse = ComfyUI's Model Sparse Attention (sol-attn) "
                  "on every step: much faster on long sequences (rdh measured ~4x on a 2K "
                  "refine), close to dense but approximate -- compare faces before relying on it.")
-JOIN_TIP = ("crossfade = neighbouring chunks are re-drawn independently and blended over "
-            "the frames they share. continue = the shared frames are held to what the "
-            "previous chunk drew and the next chunk carries on from them, so faces do not "
-            "settle into a slightly different face at a join. Whole-frame chunks only "
-            "(a tiled chunk falls back to crossfade).")
+JOIN_TIP = ("crossfade = every chunk is re-drawn on its own and the 17 frames neighbours share "
+            "are blended. stepped = the chunks are stepped TOGETHER, the way spatial tiles "
+            "are: after each of the re-draw's steps, the frames two chunks share are merged "
+            "into one state before either takes the next step, from one film-wide noise "
+            "field. Two chunks then converge on one face instead of meeting as two, and a "
+            "chunk's last step (which tends to come out off-tone) weighs least. Same compute, "
+            "one sampler call per chunk per step. Whole-frame chunks only.")
 CHUNKING_TIP = ("On = the clip may be cut into 102-frame chunks (never under 68) when it does "
                 "not fit tile_tokens. Off = the whole clip in one pass: no joins, VRAM grows with "
                 "its length. Clips over 4x tile_tokens (~18 s at 2 MP and 70000; in HandTieClips "
