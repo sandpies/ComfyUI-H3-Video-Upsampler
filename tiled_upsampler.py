@@ -918,7 +918,8 @@ def upscale_chunks_batch(videos, name, w_px, h_px):
 
     try:
         on_gpu = dev.type == "cuda"
-        net = net.to(device=dev, dtype=UPSCALER_DTYPE)
+        # A CPU-only device runs `run(v, cpu, float32)` below: weights to match.
+        net = net.to(device=dev, dtype=UPSCALER_DTYPE if on_gpu else torch.float32)
         for i, v in enumerate(videos):
             if not on_gpu and dev.type == "cuda":
                 # The previous chunk fell back to the CPU; give the GPU another try
@@ -1206,10 +1207,13 @@ def apply_sparse_attention(model):
                                                          parse_block_list)
     except Exception as exc:  # noqa: BLE001
         return model, f"dense (this ComfyUI has no sparse attention: {exc.__class__.__name__})"
-    m = apply_block_sparse_attention(
-        model, tau=1.3, topk_ratio=0.0, vsa=False, start_percent=0.0, end_percent=1.0,
-        min_tokens=12288, dense_blocks=parse_block_list(""),
-        sink_conditioning="exact_kv_and_rows", extra_tokens=256, verbose=False)
+    try:
+        m = apply_block_sparse_attention(
+            model, tau=1.3, topk_ratio=0.0, vsa=False, start_percent=0.0, end_percent=1.0,
+            min_tokens=12288, dense_blocks=parse_block_list(""),
+            sink_conditioning="exact_kv_and_rows", extra_tokens=256, verbose=False)
+    except Exception as exc:  # noqa: BLE001 -- another core's signature: dense, not a failed run
+        return model, f"dense (sparse attention failed: {exc.__class__.__name__}: {exc})"
     return m, "sparse (sol-attn, tau 1.3)"
 
 
