@@ -251,7 +251,8 @@
     "max",
     "video/H3_upsampled",
     "source",
-    true
+    true,
+    0.8
    ]
   },
   {

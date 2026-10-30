@@ -78,6 +78,19 @@ REGEN2K_SEED = 42
 REGEN2K_SIGMAS = torch.tensor([0.8, 24.0 / 35.0, 0.48, 0.0], dtype=torch.float32)
 REGEN2K_SIGMAS_RELEASE = torch.tensor([0.909375, 6.0 / 7.0, 2.0 / 3.0, 0.0], dtype=torch.float32)
 REGEN2K_SIGMAS_2STEP = torch.tensor([0.7, 0.494118, 0.0], dtype=torch.float32)
+REGEN2K_SHIFT = 6.0
+
+
+def regen2k_sigmas(start=0.8, steps=3, shift=REGEN2K_SHIFT):
+    """Regen2K's grid from any `start`: `steps` even steps in unshifted sigma,
+    then shifted (s*x / (1 + (s-1)*x)). start 0.8 gives REGEN2K_SIGMAS exactly
+    ([0.8, 24/35, 0.48, 0]); lower starts from less noise, so the re-draw
+    re-imagines less (a face stays closer to the source) and sharpens less."""
+    start = float(start)
+    raw = start / (shift - (shift - 1.0) * start)
+    sig = [start] + [shift * x / (1.0 + (shift - 1.0) * x)
+                     for x in (raw * (1.0 - i / steps) for i in range(1, steps))] + [0.0]
+    return torch.tensor(sig, dtype=torch.float32)
 # Structure lock: the re-draw's large shapes held to the 3D upscaler's (see
 # structure_lock_fn). 0 = off, the recipe as it was. LOCK_SIGMA is the blur in
 # latent cells (16 px each) that separates "layout" from "detail".
