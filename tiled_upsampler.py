@@ -82,6 +82,16 @@ REGEN2K_SIGMAS_2STEP = torch.tensor([0.7, 0.494118, 0.0], dtype=torch.float32)
 # latent cells (16 px each) that separates "layout" from "detail".
 STRUCTURE_LOCK = 0.0
 LOCK_SIGMA = 2.0
+# attention: ComfyUI's Model Sparse Attention (sol-attn) on every step, or dense.
+# chunk_join: crossfade two independent re-draws over the shared frames, or
+#   continue -- the shared frames are held to what the previous chunk drew and
+#   the rest is drawn after them (whole-frame chunks only).
+# split: auto cuts the clip into 102-frame chunks and, when a chunk does not
+#   fit tile_tokens, into spatial tiles; whole clip re-draws the clip in one
+#   pass, whole-frame -- no joins, no seams -- for short clips on big cards.
+ATTENTION_MODES = ("dense", "sparse")
+JOIN_MODES = ("crossfade", "continue")
+SPLIT_MODES = ("auto", "whole clip")
 
 # --- the guided re-draw (not part of the recipe) ----------------------------
 #
@@ -312,6 +322,12 @@ def _equal_split(total_px, count, want_overlap_px, grid=32):
 def seq_len(tile_w_px, tile_h_px, tokens):
     """One forward's sequence length: 2x2-patched cells x video latent steps."""
     return (int(tile_w_px) // 32) * (int(tile_h_px) // 32) * int(tokens)
+
+
+def factor_seq_len(w_px, h_px, tokens, factor=1):
+    """One forward's sequence for a whole frame, the guide's rows included."""
+    return (seq_len(w_px, h_px, tokens) if int(factor) <= 1
+            else guided_seq_len(w_px, h_px, tokens, factor))
 
 
 def guided_seq_len(tile_w_px, tile_h_px, tokens, factor):
@@ -856,38 +872,46 @@ def upscale_chunks_batch(videos, name, w_px, h_px):
         _free_all_gpu()
     net = load_upscaler(name)
     out_list = []
+    cpu = torch.device("cpu")
+
+    def run(v, d, dtype):
+        mean = torch.tensor(LATENT_MEAN, device=d, dtype=dtype).view(1, -1, 1, 1, 1)
+        std = torch.tensor(LATENT_STD, device=d, dtype=dtype).view(1, -1, 1, 1, 1)
+        with torch.inference_mode():
+            x = (v.to(device=d, dtype=dtype, copy=True) - mean) / std
+            o = net(x, (int(v.shape[2]), h_out, w_out), scale)
+            del x
+            return (o * std + mean).to(device="cpu", dtype=v.dtype)
+
     try:
+        on_gpu = dev.type == "cuda"
         net = net.to(device=dev, dtype=UPSCALER_DTYPE)
-        mean = torch.tensor(LATENT_MEAN, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
-        std = torch.tensor(LATENT_STD, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
-        for v in videos:
-            t = int(v.shape[2])
+        for i, v in enumerate(videos):
+            if not on_gpu and dev.type == "cuda":
+                # The previous chunk fell back to the CPU; give the GPU another try
+                # rather than running every remaining chunk at CPU speed.
+                try:
+                    net = net.to(device=dev, dtype=UPSCALER_DTYPE)
+                    on_gpu = True
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_oom(exc):
+                        raise
+                    net = net.to(device=cpu, dtype=torch.float32)
+            if not on_gpu:
+                out_list.append(run(v, cpu, torch.float32))
+                continue
             try:
-                with torch.inference_mode():
-                    x = (v.to(device=dev, dtype=UPSCALER_DTYPE, copy=True) - mean) / std
-                    o = net(x, (t, h_out, w_out), scale)
-                    del x
-                    o = o * std + mean
-                out_list.append(o.to(device="cpu", dtype=v.dtype))
-                del o
+                out_list.append(run(v, dev, UPSCALER_DTYPE))
             except Exception as exc:
-                if dev.type != "cuda" or not _is_oom(exc):
+                if not _is_oom(exc):
                     raise
-                print(f"[{TAG}] CUDA VRAM tight during 3D latent upscale ({exc}); "
-                      "sharing load with CPU...", flush=True)
-                net.to("cpu")
+                print(f"[{TAG}] CUDA VRAM tight during 3D latent upscale of chunk {i + 1}/"
+                      f"{len(videos)} ({exc}); this chunk on the CPU, the next one back on "
+                      "the GPU", flush=True)
+                net = net.to(device=cpu, dtype=torch.float32)
                 torch.cuda.empty_cache()
-                dev = torch.device("cpu")
-                net = net.to(device=dev, dtype=torch.float32)
-                mean = torch.tensor(LATENT_MEAN, device=dev, dtype=torch.float32).view(1, -1, 1, 1, 1)
-                std = torch.tensor(LATENT_STD, device=dev, dtype=torch.float32).view(1, -1, 1, 1, 1)
-                with torch.inference_mode():
-                    x = (v.to(device=dev, dtype=torch.float32, copy=True) - mean) / std
-                    o = net(x, (t, h_out, w_out), scale)
-                    del x
-                    o = o * std + mean
-                out_list.append(o.to(device="cpu", dtype=v.dtype))
-                del o
+                on_gpu = False
+                out_list.append(run(v, cpu, torch.float32))
     finally:
         net.to(device="cpu", dtype=UPSCALER_DTYPE)
         if torch.cuda.is_available():
@@ -932,6 +956,22 @@ def recipe_sigmas(model, denoise=DENOISE, steps=STEPS, start_sigma=0.0):
     return sig[-(steps + 1):]
 
 
+def apply_sparse_attention(model):
+    """ComfyUI's Model Sparse Attention (sol-attn, its defaults) on every step
+    of the re-draw. -> (model, note). Kijai's low-VRAM attention composes with
+    it. A ComfyUI without the node runs dense."""
+    try:
+        from comfy_extras.nodes_sparse_attention import (apply_block_sparse_attention,
+                                                         parse_block_list)
+    except Exception as exc:  # noqa: BLE001
+        return model, f"dense (this ComfyUI has no sparse attention: {exc.__class__.__name__})"
+    m = apply_block_sparse_attention(
+        model, tau=1.3, topk_ratio=0.0, vsa=False, start_percent=0.0, end_percent=1.0,
+        min_tokens=12288, dense_blocks=parse_block_list(""),
+        sink_conditioning="exact_kv_and_rows", extra_tokens=256, verbose=False)
+    return m, "sparse (sol-attn, tau 1.3)"
+
+
 def _apply_low_vram_patches(model, attn_chunks=4, ffn_chunks=2):
     """Apply AdaLN port, 4-way attention head chunking, and 2-way SwiGLU FFN
     token chunking (as in Seanaiochat.json's MiniMaxLowVRAMAttention(4) +
@@ -959,12 +999,15 @@ def _apply_low_vram_patches(model, attn_chunks=4, ffn_chunks=2):
     return model
 
 
-def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=None):
+def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=None,
+                known_steps=0):
     """One tile through `sigmas`, audio frozen. -> the tile's video latent.
 
     `noise` is a (video, audio) pair to use as is. SamplerCustomAdvanced's
     path, with a positive-only guider at cfg 1 and the x0 preview. `lock` is
-    a `structure_lock_fn` for this tile, or None.
+    a `structure_lock_fn` for this tile, or None. The first `known_steps`
+    latent steps of `video` are held as given (the sampler keeps them at
+    every sigma) and the rest is drawn after them.
     """
     import comfy.model_management as mm
     import comfy.nested_tensor as nt
@@ -975,9 +1018,13 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=No
 
     samples = comfy.sample.fix_empty_latent_channels(
         model, nt.NestedTensor((video, audio)), None, None)
+    vmask = torch.ones((1, 1, int(video.shape[2]) if known_steps else 1,
+                        video.shape[3], video.shape[4]),
+                       device=video.device, dtype=torch.float32)
+    if known_steps:
+        vmask[:, :, :int(known_steps)] = 0.0
     mask = nt.NestedTensor((
-        torch.ones((1, 1, 1, video.shape[3], video.shape[4]),
-                   device=video.device, dtype=torch.float32),
+        vmask,
         torch.zeros((1, 32, 2, audio.shape[-1]),
                     device=audio.device, dtype=audio.dtype)))
     guider = comfy.samplers.CFGGuider(model)
@@ -1106,7 +1153,7 @@ def _cond_extra_tokens(cond):
 def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
                  detail_sigma=0.0, noise_video=None, structure_lock=STRUCTURE_LOCK,
-                 lock_sigma=LOCK_SIGMA):
+                 lock_sigma=LOCK_SIGMA, known=None):
     """Every tile stepped together, merged under the feather after each step.
 
     Step 0 hands each tile its slice of one noise field drawn at the chunk's
@@ -1116,6 +1163,10 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     so low-frequency tile-grid shifts are stripped while fine detail is kept.
     `structure_lock` > 0 holds every tile's large shapes to its slice of
     `video` (the upscaled source) at every step; see `structure_lock_fn`.
+    `known` = (steps, latent) continues the chunk from frames already drawn:
+    its first `steps` latent steps are held to `latent` and the rest is drawn
+    after them. Whole-frame chunks only; a tiled chunk ignores it (the
+    caller's crossfade then joins it as before).
     Includes an automatic OOM guardrail: if a tile forward runs out of VRAM at
     `budget`, halves the tile token budget to split into smaller tiles and
     retries the chunk automatically.
@@ -1135,8 +1186,9 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     _oom_retries = 0
     _LAST_OOM[0] = 0
 
+    extra = _cond_extra_tokens(cond)
     while True:
-        tiles, grid = tile_grid(h, w, t, factor, cur_budget, overlap_px)
+        tiles, grid = tile_grid(h, w, t, factor, max(4096, cur_budget - extra), overlap_px)
         prepared = []
         for (r0, c0, rows, cols, st, sl, top, left, bottom, right) in tiles:
             prepared.append((r0, c0, rows, cols,
@@ -1175,13 +1227,22 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                 # DynamicVRAM DiT on every step.
                 r0, c0, rows, cols, tcond, _m = prepared[0]
                 xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
+                ks = 0
+                if known is not None and int(known[0]) > 0:
+                    ks = min(int(known[0]), t - 1)
+                    xt = xt.clone()     # a whole-frame slice may be `video` itself
+                    xt[:, :, :ks] = known[1][:, :, :ks].to(xt.device, xt.dtype)
                 noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
                 ot = sample_tile(model, tcond, sampler, sigmas, xt, audio, noise, seed,
-                                 lock=locks[0])
+                                 lock=locks[0], known_steps=ks)
                 _calls += 1
                 x = ot.to(device=dev, dtype=dt)
                 del ot, xt
             else:
+                if known is not None and int(known[0]) > 0:
+                    print(f"[{TAG}] chunk_join=continue needs a whole-frame chunk; this one is "
+                          f"{grid[0]}x{grid[1]} tiles, so it is crossfaded", flush=True)
+                    known = None
                 wsum = torch.zeros((1, 1, 1, h, w), device=dev, dtype=torch.float32)
                 for r0, c0, rows, cols, _tcond, m in prepared:
                     wsum[:, :, :, r0:r0 + rows, c0:c0 + cols] += m[:, :, 0]
@@ -1228,6 +1289,9 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
 
     if float(detail_sigma or 0.0) > 0.0:
         x = _highpass_detail_merge(video, x, sigma=float(detail_sigma))
+    if known is not None and int(known[0]) > 0:
+        ks = min(int(known[0]), t - 1)
+        x[:, :, :ks] = known[1][:, :, :ks].to(x.device, x.dtype)
     _LAST_BUDGET[0] = cur_budget
     return x, cur_budget
 
@@ -1343,7 +1407,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              chunk_frames=_DEFAULT_CHUNK_FRAMES, chunk_overlap=CHUNK_OVERLAP,
              anchor=ANCHOR_AUG, seed=SEED, noise="per_chunk",
              attn_chunks=4, ffn_chunks=2, sigmas=None,
-             structure_lock=STRUCTURE_LOCK, lock_sigma=LOCK_SIGMA):
+             structure_lock=STRUCTURE_LOCK, lock_sigma=LOCK_SIGMA,
+             attention="dense", chunk_join="crossfade", split="auto"):
     """The whole recipe on an H3 AV latent. -> the upsampled AV latent dict.
 
     `conditioning` is one conditioning for the whole clip, or a callable
@@ -1360,6 +1425,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
 
     `structure_lock` (0..1) holds each chunk's re-draw to the large shapes of
     its own 3D-upscaled frames (`structure_lock_fn`); 0 is the recipe as is.
+    `attention`, `chunk_join` and `split`: see ATTENTION_MODES and friends.
     """
     import comfy.nested_tensor as nt
 
@@ -1385,8 +1451,27 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         w_px, h_px = target_size(video.shape[4] * SPATIAL, video.shape[3] * SPATIAL,
                                  megapixels)
     model = _apply_low_vram_patches(model, attn_chunks, ffn_chunks)
+    attn_note = "dense"
+    if str(attention) == "sparse":
+        model, attn_note = apply_sparse_attention(model)
     is_regen2k = sigmas is not None
-    if is_regen2k:
+    whole = str(split) == "whole clip"
+    if whole:
+        # One chunk, one tile: the budget becomes exactly the clip's sequence, so
+        # the grid is 1x1 and an OOM retry (0.65x) goes straight to a real split.
+        if sigmas is not None:
+            sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
+                      else torch.tensor(list(sigmas), dtype=torch.float32))
+        else:
+            sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
+        plan = [(0, 0, int(tv), frames_in(int(tv)))]
+        # + headroom for conditioning rows (references), which redraw_chunk takes
+        # off the budget before cutting tiles.
+        budget = max(int(budget), factor_seq_len(w_px, h_px, int(tv), factor) + 16384)
+        print(f"[{TAG}] split=whole clip: {frames_in(int(tv))} frames in one pass, "
+              f"{budget} tokens per forward (VRAM grows with clip length; split=auto "
+              "for long clips)", flush=True)
+    elif is_regen2k:
         sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
                   else torch.tensor(list(sigmas), dtype=torch.float32))
         chunk_frames, _ = _regen2k_chunk_frames(w_px, h_px, budget, chunk_frames, overlap_px)
@@ -1401,7 +1486,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
           + (f"sigmas {[round(float(s), 4) for s in sigmas]}" if sigmas is not None
              else "no re-draw (denoise 0)")
           + (f", h3upscale guide at {w_px // factor}x{h_px // factor}"
-             if guide is not None and sigmas is not None else ""), flush=True)
+             if guide is not None and sigmas is not None else "")
+          + f", attention {attn_note}, chunk_join {chunk_join}, split {split}", flush=True)
 
     # 3-Phase non-overlapping execution so VideoVAE, 3D LatentUpscaler, and the
     # 32.4 GB DynamicVRAM H3 DiT never coexist or churn in and out of VRAM
@@ -1486,12 +1572,18 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                 print(f"[{TAG}] chunk {i + 1}/{len(plan)}: keeping lowered budget "
                       f"{cur_budget} ({_gc[0]}x{_gc[1]} tiles; would fit "
                       f"{_gi[0]}x{_gi[1]} at {init_budget})", flush=True)
+        known = None
+        if str(chunk_join) == "continue" and i > 0 and end_v > k0:
+            _ks = min(end_v - k0, int(cv.shape[2]) - 1)
+            if _ks > 0:
+                known = (_ks, out_v[:, :, k0:k0 + _ks])
         _tr = time.perf_counter()
         _rc = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, int(seed), factor,
                            cur_budget, overlap_px, detail_sigma=detail_sigma,
                            noise_video=(None if film_nv is None
                                         else film_nv[:, :, k0:k1]),
-                           structure_lock=structure_lock, lock_sigma=lock_sigma)
+                           structure_lock=structure_lock, lock_sigma=lock_sigma,
+                           known=known)
         rv, cur_budget = (_rc if isinstance(_rc, tuple) else (_rc, cur_budget))
         _redraw_s += time.perf_counter() - _tr
         _oom_total += _LAST_OOM[0]
@@ -1688,6 +1780,7 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             anchor=st["anchor_strength"], seed=st["seed"], noise=st["noise"],
             attn_chunks=st["attn_chunks"], ffn_chunks=st["ffn_chunks"],
             structure_lock=st["structure_lock"], lock_sigma=st["lock_sigma"],
+            attention=st["attention"], chunk_join=st["chunk_join"], split=st["split"],
         )
         if sigmas is not None:
             _ukw["sigmas"] = sigmas
@@ -1812,12 +1905,25 @@ class HTCTiledUpsampler:
 # recipe's single step from 0.75 kept 14% more fine detail.
 
 SETTINGS_TYPE = "HTC_UPSAMPLE"
+ATTENTION_TIP = ("dense = exact attention. sparse = ComfyUI's Model Sparse Attention (sol-attn) "
+                 "on every step: much faster on long sequences (rdh measured ~4x on a 2K "
+                 "refine), close to dense but approximate -- compare faces before relying on it.")
+JOIN_TIP = ("crossfade = neighbouring chunks are re-drawn independently and blended over "
+            "the frames they share. continue = the shared frames are held to what the "
+            "previous chunk drew and the next chunk carries on from them, so faces do not "
+            "settle into a slightly different face at a join. Whole-frame chunks only "
+            "(a tiled chunk falls back to crossfade).")
+SPLIT_TIP = ("auto = 102-frame chunks, cut into spatial tiles when a chunk does not fit "
+             "tile_tokens (any card, any length). whole clip = the clip re-drawn in one pass, "
+             "whole-frame: no joins and no seams, but VRAM grows with the clip (a 5 s clip at "
+             "2 MP is about one auto chunk). If it runs out of memory it falls back to tiles.")
 CHAIN_DEFAULTS = {
     "steps": STEPS, "start_sigma": 0.0, "noise": "per_chunk", "seed": SEED,
     "chunk_frames": _DEFAULT_CHUNK_FRAMES, "chunk_overlap": CHUNK_OVERLAP,
     "anchor_strength": ANCHOR_AUG, "tile_overlap_px": TILE_OVERLAP_PX, "detail_sigma": 0.0,
     "attn_chunks": 4, "ffn_chunks": 2, "sampler": None,
     "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
+    "attention": "dense", "chunk_join": "crossfade", "split": "auto",
 }
 
 
@@ -1908,6 +2014,15 @@ class HTCUpsampleSettings:
                     "tooltip": "What structure_lock counts as 'large', in latent cells "
                                "(16 px each). Lower holds finer features (eyes, mouth "
                                "shape) but leaves the re-draw less to sharpen."}),
+                "attention": (list(ATTENTION_MODES), {
+                    "default": d["attention"],
+                    "tooltip": ATTENTION_TIP}),
+                "chunk_join": (list(JOIN_MODES), {
+                    "default": d["chunk_join"],
+                    "tooltip": JOIN_TIP}),
+                "split": (list(SPLIT_MODES), {
+                    "default": d["split"],
+                    "tooltip": SPLIT_TIP}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {

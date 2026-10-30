@@ -518,6 +518,12 @@ class HTCVideoUpsampler:
                                 "frames H3 sees at 24 fps; silence = no sound, the mouths come "
                                 "from the frames; as_is = the old behaviour (out of sync). The "
                                 "output soundtrack is always the original.")}),
+                "attention": (list(_tu.ATTENTION_MODES), {
+                    "default": "dense", "tooltip": _tu.ATTENTION_TIP}),
+                "chunk_join": (list(_tu.JOIN_MODES), {
+                    "default": "crossfade", "tooltip": _tu.JOIN_TIP}),
+                "split": (list(_tu.SPLIT_MODES), {
+                    "default": "auto", "tooltip": _tu.SPLIT_TIP}),
             },
             "optional": {
                 "conditioning": ("CONDITIONING", {"tooltip": (
@@ -552,6 +558,7 @@ class HTCVideoUpsampler:
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
             structure_lock=0.0, lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0],
+            attention="dense", chunk_join="crossfade", split="auto",
             audio=None, audio_vae=None, conditioning=None, fps=None):
         check_vae(vae)
         n = int(images.shape[0])
@@ -566,7 +573,7 @@ class HTCVideoUpsampler:
         vid, report = redraw(
             model, video, n, (src_w, src_h), upscale_model, megapixels, denoise, lora,
             tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
-            audio, audio_vae, conditioning, fps)
+            audio, audio_vae, conditioning, fps, attention, chunk_join, split)
         img = decode_streamed(vae.decode, vid, n)
         del vid
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
@@ -588,7 +595,8 @@ def check_vae(vae):
 
 def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
            tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
-           audio, audio_vae, conditioning, fps):
+           audio, audio_vae, conditioning, fps, attention="dense", chunk_join="crossfade",
+           split="auto"):
     """Steps 2-4 for a clip already encoded: `video` is the H3 video latent of
     `n` frames padded to `valid_length(n)`. -> (upsampled video latent, report)."""
     import comfy.nested_tensor as nt
@@ -677,7 +685,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
         out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
                            float(megapixels), 0.0, guide=None,
                            budget=int(tile_tokens), steps=1, start_sigma=0.0,
-                           overlap_px=overlap_px, detail_sigma=0.0)
+                           overlap_px=overlap_px, detail_sigma=0.0, split=split)
     else:
         steps = len(r2k_sigmas) - 1
         out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
@@ -685,7 +693,8 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
                            budget=int(tile_tokens), steps=steps, start_sigma=0.0,
                            overlap_px=overlap_px, detail_sigma=0.0,
                            seed=int(redraw_seed), noise="per_chunk",
-                           sigmas=r2k_sigmas, structure_lock=lock, lock_sigma=lock_sig)
+                           sigmas=r2k_sigmas, structure_lock=lock, lock_sigma=lock_sig,
+                           attention=attention, chunk_join=chunk_join, split=split)
     _tu._free(model)
     if _tu._device().type == "cuda":
         _tu._free_all_gpu()
@@ -695,7 +704,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
               f"{int(vid.shape[4]) * _tu.SPATIAL}x{int(vid.shape[3]) * _tu.SPATIAL}"
               f", regen2k ({lora_tag}, {steps} steps, {cond_note}"
               f", structure lock {lock:g} at {lock_sig:g} cells)"
-              f", {audio_note}"
+              f", {audio_note}, attention {attention}, chunk_join {chunk_join}, split {split}"
               f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
     print(f"[{TAG}] {report}", flush=True)
     return vid, report
@@ -752,7 +761,8 @@ class HTCVideoUpsamplerToFile:
 
     def run(self, video, model, vae, upscale_model, megapixels, denoise, lora, tile_tokens,
             sampler_name, redraw_seed=REGEN2K_SEED, structure_lock=0.0,
-            lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0], frame_gen="off",
+            lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0], attention="dense",
+            chunk_join="crossfade", split="auto", frame_gen="off",
             codec="auto", quality="max", filename_prefix="video/H3_upsampled",
             frame_rate=FRAME_RATES[0], reuse_encoded=True,
             audio_vae=None, conditioning=None, prompt=None, extra_pnginfo=None):
@@ -809,7 +819,7 @@ class HTCVideoUpsamplerToFile:
         vid, report = redraw(
             model, lat, n, src_size, upscale_model, megapixels, denoise, lora,
             tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
-            audio, audio_vae, conditioning, fps)
+            audio, audio_vae, conditioning, fps, attention, chunk_join, split)
         del lat
         out_w, out_h = int(vid.shape[4]) * _tu.SPATIAL, int(vid.shape[3]) * _tu.SPATIAL
         res = _sv.encode_stream(decode_slices(vae.decode, vid, n), n, out_w, out_h, fps,

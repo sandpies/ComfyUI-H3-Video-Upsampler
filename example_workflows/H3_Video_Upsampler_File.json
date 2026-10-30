@@ -24,7 +24,7 @@
     "Node name for S&R": "MarkdownNote"
    },
    "widgets_values": [
-    "## H3 Video Upsampler (file to file)\n\nThe same re-draw as the IMAGE workflow, for clips of any length on any machine: the video is read, encoded, re-drawn, decoded and saved **a chunk at a time**, so RAM stays flat however long the film is (the IMAGE path holds the whole clip twice; a minute at 48 fps is over 100 GB).\n\n1. **Load Video**: pick the clip. Frame rate and soundtrack come from the file.\n2. **Queue.** The MP4 lands in `video/H3_upsampled` with the original soundtrack.\n\n### The node\n- **megapixels / denoise / lora / tile_tokens / redraw_seed**: as in the IMAGE workflow.\n- **structure_lock** (0 = off) holds faces, hands and line work to the clip; try 0.5-1. **lock_sigma** 1-1.5 also holds eyes and mouths on medium shots.\n- **off_24_audio**: H3 runs on a 24 fps clock; for other rates `retime` keeps the re-draw's lip sync.\n- **frame_gen / codec / quality**: as in H3 Save Video. x2 doubles the frame rate (RTX + `nvidia-vfx`).\n- **conditioning** (optional): a CLIPTextEncode of the clip's look. Unwired = zeroed out.\n- **frame_rate**: `24 (H3 native)` re-times the clip to 24 fps while reading (nearest frame), so the soundtrack lines up exactly and a 48 fps clip costs half the re-draw; add `frame_gen` x2 to save 48 again.\n- **reuse_encoded**: the next run on the same clip skips reading and encoding (kept in ComfyUI's temp folder until restart). Handy for A/B runs of structure_lock or seeds."
+    "## H3 Video Upsampler (file to file)\n\nThe same re-draw as the IMAGE workflow, for clips of any length on any machine: the video is read, encoded, re-drawn, decoded and saved **a chunk at a time**, so RAM stays flat however long the film is (the IMAGE path holds the whole clip twice; a minute at 48 fps is over 100 GB).\n\n1. **Load Video**: pick the clip. Frame rate and soundtrack come from the file.\n2. **Queue.** The MP4 lands in `video/H3_upsampled` with the original soundtrack.\n\n### The node\n- **megapixels / denoise / lora / tile_tokens / redraw_seed**: as in the IMAGE workflow.\n- **structure_lock** (0 = off) holds faces, hands and line work to the clip; try 0.5-1. **lock_sigma** 1-1.5 also holds eyes and mouths on medium shots.\n- **off_24_audio**: H3 runs on a 24 fps clock; for other rates `retime` keeps the re-draw's lip sync.\n- **frame_gen / codec / quality**: as in H3 Save Video. x2 doubles the frame rate (RTX + `nvidia-vfx`).\n- **conditioning** (optional): a CLIPTextEncode of the clip's look. Unwired = zeroed out.\n- **frame_rate**: `24 (H3 native)` re-times the clip to 24 fps while reading (nearest frame), so the soundtrack lines up exactly and a 48 fps clip costs half the re-draw; add `frame_gen` x2 to save 48 again.\n- **reuse_encoded**: the next run on the same clip skips reading and encoding (kept in ComfyUI's temp folder until restart). Handy for A/B runs of structure_lock or seeds.\n\n**Speed and joins:** `attention` sparse = ComfyUI's sparse attention (much faster on long sequences, approximate: compare faces). `chunk_join` continue = each chunk carries on from the frames the previous one drew instead of blending two re-draws. `split` whole clip = one pass, no chunks and no tiles, for short clips on big cards (VRAM grows with length)."
    ]
   },
   {
@@ -240,6 +240,9 @@
     0.0,
     2.0,
     "retime",
+    "dense",
+    "crossfade",
+    "auto",
     "off",
     "auto",
     "max",
