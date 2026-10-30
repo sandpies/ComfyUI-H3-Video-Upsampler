@@ -245,6 +245,7 @@
     "crossfade",
     true,
     true,
+    "none",
     "off",
     "auto",
     "max",

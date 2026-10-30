@@ -529,6 +529,8 @@ class HTCVideoUpsampler:
                     "default": "crossfade", "tooltip": _tu.JOIN_TIP}),
                 "chunking": ("BOOLEAN", {"default": True, "tooltip": _tu.CHUNKING_TIP}),
                 "tiling": ("BOOLEAN", {"default": True, "tooltip": _tu.TILING_TIP}),
+                "tile_context": (list(_tu.TILE_CONTEXTS), {
+                    "default": "none", "tooltip": _tu.TILE_CONTEXT_TIP}),
             },
             "optional": {
                 "conditioning": ("CONDITIONING", {"tooltip": (
@@ -564,7 +566,8 @@ class HTCVideoUpsampler:
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
             structure_lock=0.0, lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0],
             attention="dense", chunk_join="crossfade", chunking=True, tiling=True,
-            lock_anchor="source", audio=None, audio_vae=None, conditioning=None, fps=None):
+            tile_context="none", lock_anchor="source", audio=None, audio_vae=None,
+            conditioning=None, fps=None):
         check_vae(vae)
         n = int(images.shape[0])
         if n < 1:
@@ -579,7 +582,7 @@ class HTCVideoUpsampler:
             model, video, n, (src_w, src_h), upscale_model, megapixels, denoise, lora,
             tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
             audio, audio_vae, conditioning, fps, attention, chunk_join, chunking, tiling,
-            lock_anchor)
+            lock_anchor, tile_context)
         img = decode_streamed(vae.decode, vid, n)
         del vid
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
@@ -602,7 +605,7 @@ def check_vae(vae):
 def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
            tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
            audio, audio_vae, conditioning, fps, attention="dense", chunk_join="crossfade",
-           chunking=True, tiling=True, lock_anchor="source"):
+           chunking=True, tiling=True, lock_anchor="source", tile_context="none"):
     """Steps 2-4 for a clip already encoded: `video` is the H3 video latent of
     `n` frames padded to `valid_length(n)`. -> (upsampled video latent, report)."""
     import comfy.nested_tensor as nt
@@ -702,7 +705,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
                            seed=int(redraw_seed), noise="per_chunk",
                            sigmas=r2k_sigmas, structure_lock=lock, lock_sigma=lock_sig,
                            attention=attention, chunk_join=chunk_join, chunking=chunking,
-                           tiling=tiling, lock_anchor=lock_anchor)
+                           tiling=tiling, lock_anchor=lock_anchor, tile_context=tile_context)
     _tu._free(model)
     if _tu._device().type == "cuda":
         _tu._free_all_gpu()
@@ -714,7 +717,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
               f", structure lock {lock:g} at {lock_sig:g} cells)"
               f", {audio_note}, attention {attention}, chunk_join {chunk_join}"
               f", chunking {'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}"
-              f", lock anchor {lock_anchor}"
+              f", lock anchor {lock_anchor}, tile context {tile_context}"
               f", tile budget {int(tile_tokens) or 'auto'}, overlap {overlap_px}px")
     print(f"[{TAG}] {report}", flush=True)
     return vid, report
@@ -773,7 +776,7 @@ class HTCVideoUpsamplerToFile:
             sampler_name, redraw_seed=REGEN2K_SEED, structure_lock=0.0,
             lock_sigma=_tu.LOCK_SIGMA, lock_anchor="source", off_24_audio=OFF_24_AUDIO[0],
             attention="dense", chunk_join="crossfade", chunking=True, tiling=True,
-            frame_gen="off",
+            tile_context="none", frame_gen="off",
             codec="auto", quality="max", filename_prefix="video/H3_upsampled",
             frame_rate=FRAME_RATES[0], reuse_encoded=True,
             audio_vae=None, conditioning=None, prompt=None, extra_pnginfo=None):
@@ -831,7 +834,7 @@ class HTCVideoUpsamplerToFile:
             model, lat, n, src_size, upscale_model, megapixels, denoise, lora,
             tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
             audio, audio_vae, conditioning, fps, attention, chunk_join, chunking, tiling,
-            lock_anchor)
+            lock_anchor, tile_context)
         del lat
         out_w, out_h = int(vid.shape[4]) * _tu.SPATIAL, int(vid.shape[3]) * _tu.SPATIAL
         res = _sv.encode_stream(decode_slices(vae.decode, vid, n), n, out_w, out_h, fps,

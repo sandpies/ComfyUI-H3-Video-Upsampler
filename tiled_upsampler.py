@@ -101,6 +101,14 @@ LOCK_SIGMA = 2.0
 ATTENTION_MODES = ("dense", "sparse")
 JOIN_MODES = ("crossfade", "continue")
 LOCK_ANCHORS = ("source", "upscaler")
+# tile_context (draft): what a tile knows about the rest of its frame. none =
+#   only its own window (and structure_lock's anchor). global pass = before the
+#   tiles, the chunk is re-drawn WHOLE-FRAME at the largest size that fits the
+#   budget, with the same steps; the tiles then hold their large shapes to that
+#   result (structure_lock at full strength), so the layout -- a face, a hand, a
+#   line -- is decided by a pass that saw all of it, and the tiles add detail.
+#   Only chunks that are actually tiled pay for it.
+TILE_CONTEXTS = ("none", "global pass")
 WHOLE_CLIP_MAX = 4          # chunking off only up to this many tile_tokens (else chunked)
 
 # --- the guided re-draw (not part of the recipe) ----------------------------
@@ -1275,10 +1283,62 @@ def _cond_extra_tokens(cond):
     return extra
 
 
+def _cond_resized(cond, h, w):
+    """`cond` with every (unstrided) keyframe latent resized to an h x w grid."""
+    out = []
+    for emb, d in cond:
+        d = dict(d)
+        if d.get("minimax_keyframes"):
+            kfs = []
+            for kf in d["minimax_keyframes"]:
+                kf = dict(kf)
+                lt = kf.get("latent")
+                if lt is not None and int(kf.get(STRIDE_KEY, 1)) <= 1 and (
+                        lt.shape[3] != h or lt.shape[4] != w):
+                    kf["latent"] = _resize_planes(lt, h, w, torch.float32).to(lt.dtype)
+                kfs.append(kf)
+            d["minimax_keyframes"] = kfs
+        out.append([emb, d])
+    return out
+
+
+def global_pass(model, cond, sampler, sigmas, video, audio, seed, budget,
+                lock_src=None, structure_lock=0.0, lock_sigma=LOCK_SIGMA, factor=1):
+    """`video` re-drawn whole-frame at the largest size whose sequence fits
+    `budget`, then brought back to its own grid. -> (latent, note); the
+    latent is None when it would not help (it fits whole already, a guided
+    re-draw, or the frame would shrink below 8x8 latent cells)."""
+    import comfy.nested_tensor as nt
+    import comfy.sample
+    if int(factor) > 1:
+        return None, ""
+    _, _, t, h, w = video.shape
+    full = seq_len(w * SPATIAL, h * SPATIAL, t)
+    scale = math.sqrt(float(budget) / float(full))
+    if scale >= 1.0:
+        return None, ""
+    hg, wg = int(h * scale) // 2 * 2, int(w * scale) // 2 * 2
+    if hg < 8 or wg < 8:
+        return None, f"global pass skipped: {wg * SPATIAL}x{hg * SPATIAL}px is too small to help"
+    small = F.interpolate(video.float(), size=(t, hg, wg), mode="area").to(video.dtype)
+    field = comfy.sample.prepare_noise(nt.NestedTensor((small, audio)), seed)
+    lock = None
+    if lock_src is not None and float(structure_lock) > 0.0:
+        lock = structure_lock_fn(
+            F.interpolate(lock_src.float(), size=(t, hg, wg), mode="area").to(video.dtype),
+            structure_lock, max(0.5, float(lock_sigma) * scale))
+    out = sample_tile(model, _cond_resized(cond, hg, wg), sampler, sigmas, small, audio,
+                      (field.tensors[0], field.tensors[1]), seed, lock=lock)
+    back = F.interpolate(out.to(video.device).float(), size=(t, h, w), mode="trilinear",
+                         align_corners=False).to(video.dtype)
+    return back, f"global pass at {wg * SPATIAL}x{hg * SPATIAL}px"
+
+
 def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
                  detail_sigma=0.0, noise_video=None, structure_lock=STRUCTURE_LOCK,
-                 lock_sigma=LOCK_SIGMA, known=None, anchor=None, allow_tiles=True):
+                 lock_sigma=LOCK_SIGMA, known=None, anchor=None, allow_tiles=True,
+                 tile_context="none"):
     """Every tile stepped together, merged under the feather after each step.
 
     Step 0 hands each tile its slice of one noise field drawn at the chunk's
@@ -1294,7 +1354,9 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     caller's crossfade then joins it as before). `anchor` replaces `video`
     as what structure_lock holds the large shapes to. `allow_tiles` False
     keeps the chunk whole-frame whatever the budget, and an OOM is an error
-    instead of a retry in tiles.
+    instead of a retry in tiles. `tile_context` "global pass" re-draws the
+    chunk whole-frame at a reduced size first and holds the tiles' large
+    shapes to it (see TILE_CONTEXTS).
     Includes an automatic OOM guardrail: if a tile forward runs out of VRAM at
     `budget`, halves the tile token budget to split into smaller tiles and
     retries the chunk automatically.
@@ -1375,6 +1437,21 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                     print(f"[{TAG}] chunk_join=continue needs a whole-frame chunk; this one is "
                           f"{grid[0]}x{grid[1]} tiles, so it is crossfaded", flush=True)
                     known = None
+                if str(tile_context) == "global pass":
+                    g, g_note = global_pass(
+                        model, cond, sampler, sigmas, video, audio, seed,
+                        max(4096, cur_budget - extra), lock_src, structure_lock, lock_sigma,
+                        factor)
+                    if g is not None:
+                        _calls += 1
+                        locks = [structure_lock_fn(g[:, :, :, r0:r0 + rows, c0:c0 + cols],
+                                                   1.0, lock_sigma)
+                                 for (r0, c0, rows, cols, *_rest) in prepared]
+                        del g
+                    if g_note:
+                        print(f"[{TAG}] {g_note}; the {grid[0]}x{grid[1]} tiles hold their "
+                              "large shapes to it" if g_note.startswith("global pass at")
+                              else f"[{TAG}] {g_note}", flush=True)
                 wsum = torch.zeros((1, 1, 1, h, w), device=dev, dtype=torch.float32)
                 for r0, c0, rows, cols, _tcond, m in prepared:
                     wsum[:, :, :, r0:r0 + rows, c0:c0 + cols] += m[:, :, 0]
@@ -1546,7 +1623,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              attn_chunks=4, ffn_chunks=2, sigmas=None,
              structure_lock=STRUCTURE_LOCK, lock_sigma=LOCK_SIGMA,
              attention="dense", chunk_join="crossfade", chunking=True, tiling=True,
-             lock_anchor="source"):
+             lock_anchor="source", tile_context="none"):
     """The whole recipe on an H3 AV latent. -> the upsampled AV latent dict.
 
     `conditioning` is one conditioning for the whole clip, or a callable
@@ -1633,7 +1710,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              if guide is not None and sigmas is not None else "")
           + f", tile_tokens {budget_note}, attention {attn_note}, chunk_join {chunk_join}, chunking "
           f"{'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}, lock anchor "
-          f"{lock_anchor}", flush=True)
+          f"{lock_anchor}, tile context {tile_context}", flush=True)
 
     # 3-Phase non-overlapping execution so VideoVAE, 3D LatentUpscaler, and the
     # 32.4 GB DynamicVRAM H3 DiT never coexist or churn in and out of VRAM
@@ -1743,7 +1820,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                            noise_video=(None if film_nv is None
                                         else film_nv[:, :, k0:k1]),
                            structure_lock=structure_lock, lock_sigma=lock_sigma,
-                           known=known, anchor=anchor, allow_tiles=tiling)
+                           known=known, anchor=anchor, allow_tiles=tiling,
+                           tile_context=tile_context)
         rv, cur_budget = (_rc if isinstance(_rc, tuple) else (_rc, cur_budget))
         _redraw_s += time.perf_counter() - _tr
         _oom_total += _LAST_OOM[0]
@@ -1952,6 +2030,7 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             structure_lock=st["structure_lock"], lock_sigma=st["lock_sigma"],
             attention=st["attention"], chunk_join=st["chunk_join"],
             chunking=st["chunking"], tiling=st["tiling"], lock_anchor=st["lock_anchor"],
+            tile_context=st["tile_context"],
         )
         if sigmas is not None:
             _ukw["sigmas"] = sigmas
@@ -2096,6 +2175,11 @@ LOCK_ANCHOR_TIP = ("What structure_lock holds the large shapes to. source = the 
                    "enlarged by plain interpolation: nothing invented, so errors the 3D upscaler "
                    "adds (a blown patch, a colour shift) are pulled back too. upscaler = the 3D "
                    "upscaler's output, as before.")
+TILE_CONTEXT_TIP = ("Draft. Only matters when a chunk is cut into tiles. none = each tile sees "
+                    "its own window. global pass = the chunk is first re-drawn whole-frame at "
+                    "the largest size that fits tile_tokens, and the tiles hold their large "
+                    "shapes to that pass, so faces and layout come from a pass that saw the "
+                    "whole frame. Costs one smaller pass per tiled chunk.")
 CHAIN_DEFAULTS = {
     "steps": STEPS, "start_sigma": 0.0, "noise": "per_chunk", "seed": SEED,
     "chunk_frames": _DEFAULT_CHUNK_FRAMES, "chunk_overlap": CHUNK_OVERLAP,
@@ -2103,7 +2187,7 @@ CHAIN_DEFAULTS = {
     "attn_chunks": 4, "ffn_chunks": 2, "sampler": None,
     "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
     "attention": "dense", "chunk_join": "crossfade", "chunking": True, "tiling": True,
-    "lock_anchor": "source",
+    "lock_anchor": "source", "tile_context": "none",
 }
 
 
@@ -2206,6 +2290,8 @@ class HTCUpsampleSettings:
                     "default": d["tiling"], "tooltip": TILING_TIP}),
                 "lock_anchor": (list(LOCK_ANCHORS), {
                     "default": d["lock_anchor"], "tooltip": LOCK_ANCHOR_TIP}),
+                "tile_context": (list(TILE_CONTEXTS), {
+                    "default": d["tile_context"], "tooltip": TILE_CONTEXT_TIP}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {
