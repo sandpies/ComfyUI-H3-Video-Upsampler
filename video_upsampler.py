@@ -869,6 +869,20 @@ RESIZE_MODES = ("none", "megapixels", "long edge")
 FRAME_BATCH = 32            # frames decoded, resized and stored per step
 
 
+def frames_for_seconds(seconds, fps, snap=True):
+    """How many frames `seconds` is at `fps`; with `snap`, the nearest length H3
+    uses natively (17n + 5), so nothing downstream is padded (30 s at 24 fps =
+    719, 5 s = 124)."""
+    n = max(1, int(round(float(seconds) * float(fps))))
+    if not snap:
+        return n
+    if n <= 5:
+        return 5
+    lo = 17 * ((n - 5) // 17) + 5
+    hi = lo + 17
+    return lo if n - lo <= hi - n else hi
+
+
 def resize_target(w, h, mode, value, even=2):
     """(w, h) after `resize`: area to `value` megapixels or the long edge to
     `value` px, aspect kept, never enlarged, both edges on a multiple of 2."""
@@ -923,9 +937,12 @@ class HTCVideoFrames:
                 "start_seconds": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01,
                     "tooltip": "Skip this much of the video first."}),
-                "max_frames": ("INT", {
-                    "default": 0, "min": 0, "max": 1000000,
-                    "tooltip": "Stop after this many frames (counted after frame_rate). 0 = to the end."}),
+                "duration_seconds": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.5,
+                    "tooltip": ("How much to take from start_seconds on. 0 = to the end. With "
+                                "snap_to_h3 the frame count is rounded to the nearest length H3 "
+                                "uses natively (30 s at 24 fps = 719 frames); the log says what "
+                                "you got.")}),
                 "frame_rate": (list(FRAME_RATES), {
                     "default": FRAME_RATES[0],
                     "tooltip": ("source = every frame. 24 = re-timed to H3's own rate while "
@@ -938,6 +955,11 @@ class HTCVideoFrames:
                 "resize_value": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 16384.0, "step": 0.01,
                     "tooltip": "Megapixels (resize = megapixels) or pixels (resize = long edge)."}),
+                "snap_to_h3": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": ("Round duration_seconds to the nearest frame count H3 uses "
+                                "natively (17n + 5), so nothing is padded. Off = exactly "
+                                "seconds x fps.")}),
             },
         }
 
@@ -946,24 +968,27 @@ class HTCVideoFrames:
     FUNCTION = "run"
     CATEGORY = "video/upscale"
     DESCRIPTION = (
-        "Get Video Components without the RAM bill: start, max_frames, a 24 fps re-time and a "
+        "Get Video Components without the RAM bill: start, duration, a 24 fps re-time and a "
         "resize are applied while decoding, so skipped frames are never held, and the frames "
         "are filled into the IMAGE once (peak about 1.25x the output).")
 
-    def run(self, video, start_seconds=0.0, max_frames=0, frame_rate=FRAME_RATES[0],
-            resize="none", resize_value=1.0):
+    def run(self, video, start_seconds=0.0, duration_seconds=0.0, frame_rate=FRAME_RATES[0],
+            resize="none", resize_value=1.0, snap_to_h3=True):
         import itertools
         import numpy as np
         import comfy.model_management as mm
 
         to_24 = str(frame_rate) != FRAME_RATES[0]
         start_s = max(0.0, float(start_seconds))
-        limit = int(max_frames) if int(max_frames) > 0 else None
+        want_s = max(0.0, float(duration_seconds or 0.0))
+        limit = None
         src = _video_file(video)
         if src is not None:
             source, start, duration, crop = src
             src_fps = float(video.get_frame_rate())
             fps = float(H3_FPS) if to_24 else src_fps
+            if want_s > 0.0:
+                limit = frames_for_seconds(want_s, fps, bool(snap_to_h3))
             if duration and start_s >= duration:
                 raise ValueError(f"{TAG}: start_seconds {start_s:g} is past the video's "
                                  f"{duration:g} s")
@@ -1003,6 +1028,8 @@ class HTCVideoFrames:
             imgs, audio = comp.images, comp.audio
             src_fps = float(comp.frame_rate)
             fps = float(H3_FPS) if to_24 else src_fps
+            if want_s > 0.0:
+                limit = frames_for_seconds(want_s, fps, bool(snap_to_h3))
             first = int(round(start_s * src_fps))
             idx = range(first, int(imgs.shape[0]))
             if to_24 and abs(src_fps - fps) > 1e-3:
@@ -1021,7 +1048,10 @@ class HTCVideoFrames:
                 audio = {"waveform": audio["waveform"][..., a0:a0 + int(round(n / fps * sr))],
                          "sample_rate": sr}
             how = "not a plain file (components or list): decoded whole, then selected"
-        print(f"[{TAG}] video frames: {n} at {int(images.shape[2])}x{int(images.shape[1])}, "
+        took = (f"{want_s:g} s asked -> {n} frames ({n / fps:.2f} s"
+                + (", H3 length" if snap_to_h3 else "") + ")" if want_s > 0.0
+                else f"{n} frames ({n / fps:.2f} s, to the end)")
+        print(f"[{TAG}] video frames: {took} at {int(images.shape[2])}x{int(images.shape[1])}, "
               f"{fps:g} fps (source {src_fps:g}), from {start_s:g} s, {how}; IMAGE "
               f"{images.numel() * 4 / 1048576.0:.0f} MB", flush=True)
         return (images, audio, fps, n, video)

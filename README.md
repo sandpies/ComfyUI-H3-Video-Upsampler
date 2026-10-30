@@ -136,7 +136,8 @@ a 600-frame 640×360 test clip, peak RAM was **1.08×** the output, against
 | widget | what it does |
 |---|---|
 | `start_seconds` | skip this much first |
-| `max_frames` | stop after this many frames (0 = to the end) |
+| `duration_seconds` | how much to take, in seconds (0 = to the end) |
+| `snap_to_h3` | on (default): round to the nearest length H3 uses natively (17n + 5 frames: 30 s at 24 fps = 719), so nothing is padded; the log says what you got. Off = exactly seconds x fps |
 | `frame_rate` | `source`, or `24 (H3 native)`: nearest-frame re-time on read, duration and sync kept |
 | `resize` / `resize_value` | shrink while decoding to a megapixel area or a long edge in px; never enlarges |
 
