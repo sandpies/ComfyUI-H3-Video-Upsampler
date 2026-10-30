@@ -86,12 +86,21 @@ LOCK_SIGMA = 2.0
 # chunk_join: crossfade two independent re-draws over the shared frames, or
 #   continue -- the shared frames are held to what the previous chunk drew and
 #   the rest is drawn after them (whole-frame chunks only).
-# split: auto cuts the clip into 102-frame chunks and, when a chunk does not
-#   fit tile_tokens, into spatial tiles; whole clip re-draws the clip in one
-#   pass, whole-frame -- no joins, no seams -- for short clips on big cards.
+# chunking / tiling: each one ALLOWS a split when the clip does not fit
+#   tile_tokens; neither forces one. chunking cuts time into 102-frame chunks
+#   (no shorter than 68 -- Regen2K's 3 steps from 0.8 invent on short pieces);
+#   tiling cuts space. Time is cut before space: a tile sees part of the frame,
+#   which is where invention comes from, while a join in time is held together
+#   by chunk_join=continue and structure_lock. Both off = the whole clip in one
+#   whole-frame pass.
+# lock_anchor: what structure_lock holds the large shapes to. source = the
+#   clip's own latent, enlarged by plain interpolation (nothing invented, so
+#   errors the 3D upscaler adds -- a blown patch, a colour shift -- are pulled
+#   back too); upscaler = the 3D upscaler's output.
 ATTENTION_MODES = ("dense", "sparse")
 JOIN_MODES = ("crossfade", "continue")
-SPLIT_MODES = ("auto", "whole clip")
+LOCK_ANCHORS = ("source", "upscaler")
+WHOLE_CLIP_MAX = 4          # chunking off only up to this many tile_tokens (else chunked)
 
 # --- the guided re-draw (not part of the recipe) ----------------------------
 #
@@ -1153,7 +1162,7 @@ def _cond_extra_tokens(cond):
 def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
                  detail_sigma=0.0, noise_video=None, structure_lock=STRUCTURE_LOCK,
-                 lock_sigma=LOCK_SIGMA, known=None):
+                 lock_sigma=LOCK_SIGMA, known=None, anchor=None, allow_tiles=True):
     """Every tile stepped together, merged under the feather after each step.
 
     Step 0 hands each tile its slice of one noise field drawn at the chunk's
@@ -1166,7 +1175,10 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     `known` = (steps, latent) continues the chunk from frames already drawn:
     its first `steps` latent steps are held to `latent` and the rest is drawn
     after them. Whole-frame chunks only; a tiled chunk ignores it (the
-    caller's crossfade then joins it as before).
+    caller's crossfade then joins it as before). `anchor` replaces `video`
+    as what structure_lock holds the large shapes to. `allow_tiles` False
+    keeps the chunk whole-frame whatever the budget, and an OOM is an error
+    instead of a retry in tiles.
     Includes an automatic OOM guardrail: if a tile forward runs out of VRAM at
     `budget`, halves the tile token budget to split into smaller tiles and
     retries the chunk automatically.
@@ -1187,15 +1199,18 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     _LAST_OOM[0] = 0
 
     extra = _cond_extra_tokens(cond)
+    lock_src = video if anchor is None else anchor.to(device=video.device, dtype=video.dtype)
     while True:
-        tiles, grid = tile_grid(h, w, t, factor, max(4096, cur_budget - extra), overlap_px)
+        tiles, grid = tile_grid(h, w, t, factor,
+                                max(4096, cur_budget - extra) if allow_tiles else 1 << 40,
+                                overlap_px)
         prepared = []
         for (r0, c0, rows, cols, st, sl, top, left, bottom, right) in tiles:
             prepared.append((r0, c0, rows, cols,
                              cond_for_tile(cond, h, w, r0, c0, rows, cols),
                              feather(rows, cols, st, sl, top, left, bottom, right,
                                      dev)[None, None, None]))
-        locks = [structure_lock_fn(video[:, :, :, r0:r0 + rows, c0:c0 + cols],
+        locks = [structure_lock_fn(lock_src[:, :, :, r0:r0 + rows, c0:c0 + cols],
                                    structure_lock, lock_sigma)
                  if float(structure_lock) > 0.0 else None
                  for (r0, c0, rows, cols, *_rest) in prepared]
@@ -1275,6 +1290,11 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                   flush=True)
             break
         except Exception as exc:
+            if _is_oom(exc) and not allow_tiles:
+                raise RuntimeError(
+                    f"{TAG}: out of VRAM on a whole-frame {w * SPATIAL}x{h * SPATIAL}px chunk of "
+                    f"{t} latent steps with tiling off. Turn tiling on, lower megapixels, or "
+                    "(chunking on) lower tile_tokens for shorter chunks.") from exc
             if not _is_oom(exc) or cur_budget <= 16384:
                 raise
             next_budget = max(16384, int(cur_budget * 0.65))
@@ -1408,7 +1428,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              anchor=ANCHOR_AUG, seed=SEED, noise="per_chunk",
              attn_chunks=4, ffn_chunks=2, sigmas=None,
              structure_lock=STRUCTURE_LOCK, lock_sigma=LOCK_SIGMA,
-             attention="dense", chunk_join="crossfade", split="auto"):
+             attention="dense", chunk_join="crossfade", chunking=True, tiling=True,
+             lock_anchor="source"):
     """The whole recipe on an H3 AV latent. -> the upsampled AV latent dict.
 
     `conditioning` is one conditioning for the whole clip, or a callable
@@ -1425,7 +1446,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
 
     `structure_lock` (0..1) holds each chunk's re-draw to the large shapes of
     its own 3D-upscaled frames (`structure_lock_fn`); 0 is the recipe as is.
-    `attention`, `chunk_join` and `split`: see ATTENTION_MODES and friends.
+    `attention`, `chunk_join`, `chunking`, `tiling` and `lock_anchor`: see
+    ATTENTION_MODES and the notes above it.
     """
     import comfy.nested_tensor as nt
 
@@ -1455,22 +1477,25 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     if str(attention) == "sparse":
         model, attn_note = apply_sparse_attention(model)
     is_regen2k = sigmas is not None
-    whole = str(split) == "whole clip"
+    chunking, tiling = bool(chunking), bool(tiling)
+    whole = not chunking
     if whole:
-        # One chunk, one tile: the budget becomes exactly the clip's sequence, so
-        # the grid is 1x1 and an OOM retry (0.65x) goes straight to a real split.
+        _need = factor_seq_len(w_px, h_px, int(tv), factor)
+        if _need > WHOLE_CLIP_MAX * int(budget):
+            print(f"[{TAG}] chunking off: {frames_in(int(tv))} frames would be {_need} tokens "
+                  f"in one pass, over {WHOLE_CLIP_MAX}x tile_tokens ({WHOLE_CLIP_MAX * int(budget)}); "
+                  "chunking anyway", flush=True)
+            whole = False
+    if whole:
         if sigmas is not None:
             sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
                       else torch.tensor(list(sigmas), dtype=torch.float32))
         else:
             sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
         plan = [(0, 0, int(tv), frames_in(int(tv)))]
-        # + headroom for conditioning rows (references), which redraw_chunk takes
-        # off the budget before cutting tiles.
-        budget = max(int(budget), factor_seq_len(w_px, h_px, int(tv), factor) + 16384)
-        print(f"[{TAG}] split=whole clip: {frames_in(int(tv))} frames in one pass, "
-              f"{budget} tokens per forward (VRAM grows with clip length; split=auto "
-              "for long clips)", flush=True)
+        print(f"[{TAG}] chunking off: {frames_in(int(tv))} frames in one pass "
+              f"({factor_seq_len(w_px, h_px, int(tv), factor)} tokens whole-frame"
+              + ("" if tiling else ", tiling off") + ")", flush=True)
     elif is_regen2k:
         sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
                   else torch.tensor(list(sigmas), dtype=torch.float32))
@@ -1487,7 +1512,9 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              else "no re-draw (denoise 0)")
           + (f", h3upscale guide at {w_px // factor}x{h_px // factor}"
              if guide is not None and sigmas is not None else "")
-          + f", attention {attn_note}, chunk_join {chunk_join}, split {split}", flush=True)
+          + f", attention {attn_note}, chunk_join {chunk_join}, chunking "
+          f"{'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}, lock anchor "
+          f"{lock_anchor}", flush=True)
 
     # 3-Phase non-overlapping execution so VideoVAE, 3D LatentUpscaler, and the
     # 32.4 GB DynamicVRAM H3 DiT never coexist or churn in and out of VRAM
@@ -1515,6 +1542,15 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
 
     _tp.append(time.perf_counter())
     upscaled_cvs = upscale_chunks_batch(raw_cvs, upscaler, w_px, h_px)
+    anchors = [None] * len(plan)
+    if (sigmas is not None and float(structure_lock) > 0.0
+            and str(lock_anchor) == "source"):
+        # The clip's own latent on the output grid: plain interpolation adds
+        # nothing, so its blur is the source's large shapes and no one's guess.
+        for i, (raw, up) in enumerate(zip(raw_cvs, upscaled_cvs)):
+            anchors[i] = F.interpolate(
+                raw.float(), size=tuple(int(x) for x in up.shape[2:]), mode="trilinear",
+                align_corners=False).to(dtype=up.dtype)
     del raw_cvs
     _tp.append(time.perf_counter())
     if torch.cuda.is_available():
@@ -1572,6 +1608,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                 print(f"[{TAG}] chunk {i + 1}/{len(plan)}: keeping lowered budget "
                       f"{cur_budget} ({_gc[0]}x{_gc[1]} tiles; would fit "
                       f"{_gi[0]}x{_gi[1]} at {init_budget})", flush=True)
+        anchor = anchors[i]
+        anchors[i] = None
         known = None
         if str(chunk_join) == "continue" and i > 0 and end_v > k0:
             _ks = min(end_v - k0, int(cv.shape[2]) - 1)
@@ -1583,7 +1621,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                            noise_video=(None if film_nv is None
                                         else film_nv[:, :, k0:k1]),
                            structure_lock=structure_lock, lock_sigma=lock_sigma,
-                           known=known)
+                           known=known, anchor=anchor, allow_tiles=tiling)
         rv, cur_budget = (_rc if isinstance(_rc, tuple) else (_rc, cur_budget))
         _redraw_s += time.perf_counter() - _tr
         _oom_total += _LAST_OOM[0]
@@ -1780,7 +1818,8 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             anchor=st["anchor_strength"], seed=st["seed"], noise=st["noise"],
             attn_chunks=st["attn_chunks"], ffn_chunks=st["ffn_chunks"],
             structure_lock=st["structure_lock"], lock_sigma=st["lock_sigma"],
-            attention=st["attention"], chunk_join=st["chunk_join"], split=st["split"],
+            attention=st["attention"], chunk_join=st["chunk_join"],
+            chunking=st["chunking"], tiling=st["tiling"], lock_anchor=st["lock_anchor"],
         )
         if sigmas is not None:
             _ukw["sigmas"] = sigmas
@@ -1913,17 +1952,26 @@ JOIN_TIP = ("crossfade = neighbouring chunks are re-drawn independently and blen
             "previous chunk drew and the next chunk carries on from them, so faces do not "
             "settle into a slightly different face at a join. Whole-frame chunks only "
             "(a tiled chunk falls back to crossfade).")
-SPLIT_TIP = ("auto = 102-frame chunks, cut into spatial tiles when a chunk does not fit "
-             "tile_tokens (any card, any length). whole clip = the clip re-drawn in one pass, "
-             "whole-frame: no joins and no seams, but VRAM grows with the clip (a 5 s clip at "
-             "2 MP is about one auto chunk). If it runs out of memory it falls back to tiles.")
+CHUNKING_TIP = ("On = the clip may be cut into 102-frame chunks (never under 68) when it does "
+                "not fit tile_tokens. Off = the whole clip in one pass: no joins, VRAM grows with "
+                "its length. Clips over 4x tile_tokens (~18 s at 2 MP and 70000; in HandTieClips "
+                "usually the whole film) are chunked anyway.")
+TILING_TIP = ("On = a chunk may be cut into spatial tiles when even a 68-frame chunk does not "
+              "fit tile_tokens (chunks are shortened first: a tile sees only part of the frame, "
+              "which is where invention comes from). Off = every chunk whole-frame; running out "
+              "of VRAM is then an error that says what to change.")
+LOCK_ANCHOR_TIP = ("What structure_lock holds the large shapes to. source = the clip's own latent, "
+                   "enlarged by plain interpolation: nothing invented, so errors the 3D upscaler "
+                   "adds (a blown patch, a colour shift) are pulled back too. upscaler = the 3D "
+                   "upscaler's output, as before.")
 CHAIN_DEFAULTS = {
     "steps": STEPS, "start_sigma": 0.0, "noise": "per_chunk", "seed": SEED,
     "chunk_frames": _DEFAULT_CHUNK_FRAMES, "chunk_overlap": CHUNK_OVERLAP,
     "anchor_strength": ANCHOR_AUG, "tile_overlap_px": TILE_OVERLAP_PX, "detail_sigma": 0.0,
     "attn_chunks": 4, "ffn_chunks": 2, "sampler": None,
     "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
-    "attention": "dense", "chunk_join": "crossfade", "split": "auto",
+    "attention": "dense", "chunk_join": "crossfade", "chunking": True, "tiling": True,
+    "lock_anchor": "source",
 }
 
 
@@ -2020,9 +2068,12 @@ class HTCUpsampleSettings:
                 "chunk_join": (list(JOIN_MODES), {
                     "default": d["chunk_join"],
                     "tooltip": JOIN_TIP}),
-                "split": (list(SPLIT_MODES), {
-                    "default": d["split"],
-                    "tooltip": SPLIT_TIP}),
+                "chunking": ("BOOLEAN", {
+                    "default": d["chunking"], "tooltip": CHUNKING_TIP}),
+                "tiling": ("BOOLEAN", {
+                    "default": d["tiling"], "tooltip": TILING_TIP}),
+                "lock_anchor": (list(LOCK_ANCHORS), {
+                    "default": d["lock_anchor"], "tooltip": LOCK_ANCHOR_TIP}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {

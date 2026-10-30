@@ -61,3 +61,13 @@ The file-to-file, Video Frames and Load Video (path) nodes follow ideas from **[
 The code in `video_upsampler.py` was written fresh for this pack and shares
 none of that repository's code. silveroxides agreed to this on the condition
 that the ideas are credited, which is what this section does.
+
+## Prompted by ComfyUI-DaSiWa-Nodes (no code copied)
+
+Looking at **[darksidewalker](https://github.com/darksidewalker)'s**
+[`ComfyUI-DaSiWa-Nodes`](https://github.com/darksidewalker/ComfyUI-DaSiWa-Nodes)
+(GPL-3.0) `MiniMaxH3 Enhanced Upscale`, and its separate spatial and temporal
+split switches, prompted the upsampler's `chunking` / `tiling` switches. HTC's
+version is its own design and code: time is cut before space, Regen2K's
+68-frame floor is kept, and chunking stays automatic for clips too long for
+one pass. Nothing from that repository is included.
