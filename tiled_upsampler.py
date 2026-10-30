@@ -2399,34 +2399,24 @@ class HTCTiledUpsampler:
 # recipe's single step from 0.75 kept 14% more fine detail.
 
 SETTINGS_TYPE = "HTC_UPSAMPLE"
-ATTENTION_TIP = ("dense = exact attention. sparse = ComfyUI's Model Sparse Attention (sol-attn) "
-                 "on every step: much faster on long sequences (rdh measured ~4x on a 2K "
-                 "refine), close to dense but approximate -- compare faces before relying on it.")
-JOIN_TIP = ("crossfade = every chunk is re-drawn on its own and the 17 frames neighbours share "
-            "are blended. stepped = the chunks are stepped TOGETHER, the way spatial tiles "
-            "are: after each of the re-draw's steps, the frames two chunks share are merged "
-            "into one state before either takes the next step, from one film-wide noise "
-            "field. Two chunks then converge on one face instead of meeting as two, and a "
-            "chunk's last step (which tends to come out off-tone) weighs least. Same compute, "
-            "one sampler call per chunk (or tile) per step. Tiled chunks step together "
-            "too, so it works on any card.")
-CHUNKING_TIP = ("On = the clip may be cut into 102-frame chunks (never under 68) when it does "
-                "not fit tile_tokens. Off = the whole clip in one pass: no joins, VRAM grows with "
-                "its length. Clips over 4x tile_tokens (~18 s at 2 MP and 70000; in HandTieClips "
-                "usually the whole film) are chunked anyway.")
-TILING_TIP = ("On = a chunk may be cut into spatial tiles when even a 68-frame chunk does not "
-              "fit tile_tokens (chunks are shortened first: a tile sees only part of the frame, "
-              "which is where invention comes from). Off = every chunk whole-frame; running out "
-              "of VRAM is then an error that says what to change.")
+ATTENTION_TIP = ("dense = normal. sparse = ComfyUI's sparse attention: much faster on long "
+                 "clips, but approximate, so compare faces before relying on it. Falls back to "
+                 "dense on a ComfyUI without it.")
+JOIN_TIP = ("How the overlapping pieces of a long clip are joined. stepped (recommended) = all "
+            "pieces are re-drawn together and agree at every step, so faces don't change at a "
+            "join. crossfade = each piece is re-drawn on its own and the overlaps are blended "
+            "(the old way; a face can shift at a join). Same speed.")
+CHUNKING_TIP = ("On = a long clip may be cut into overlapping pieces (about 4 s each) when it's "
+                "too much for the GPU at once. Off = the whole clip in one go: no joins, but "
+                "VRAM grows with length, so very long clips are cut anyway.")
+TILING_TIP = ("On = when even a short piece is too much for the GPU, each frame may also be "
+              "cut into overlapping tiles. Off = never tile; if VRAM runs out, it stops with a "
+              "message saying what to change.")
 LOCK_ANCHOR_TIP = ("What structure_lock holds the large shapes to. source = the clip's own latent, "
-                   "enlarged by plain interpolation: nothing invented, so errors the 3D upscaler "
-                   "adds (a blown patch, a colour shift) are pulled back too. upscaler = the 3D "
-                   "upscaler's output, as before.")
-TILE_CONTEXT_TIP = ("Draft. Only matters when a chunk is cut into tiles. none = each tile sees "
-                    "its own window. global pass = the chunk is first re-drawn whole-frame at "
-                    "the largest size that fits tile_tokens, and the tiles hold their large "
-                    "shapes to that pass, so faces and layout come from a pass that saw the "
-                    "whole frame. Costs one smaller pass per tiled chunk.")
+                   "enlarged by plain interpolation. upscaler = the 3D upscaler's output.")
+TILE_CONTEXT_TIP = ("Only matters when a chunk is cut into tiles. none = each tile sees its own "
+                    "window. global pass = the chunk is first re-drawn whole at a smaller size, "
+                    "and the tiles keep its large shapes.")
 CHAIN_DEFAULTS = {
     "steps": STEPS, "start_sigma": 0.0, "noise": "per_chunk", "seed": SEED,
     "chunk_frames": _DEFAULT_CHUNK_FRAMES, "chunk_overlap": CHUNK_OVERLAP,
@@ -2434,7 +2424,7 @@ CHAIN_DEFAULTS = {
     "attn_chunks": 4, "ffn_chunks": 2, "sampler": None,
     "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
     "attention": "dense", "chunk_join": "crossfade", "chunking": True, "tiling": True,
-    "lock_anchor": "source", "tile_context": "none",
+    "lock_anchor": "source", "tile_context": "none", "redraw_start": 0.8,
 }
 
 
@@ -2460,91 +2450,71 @@ class HTCUpsampleSettings:
             "required": {
                 "steps": ("INT", {
                     "default": 3, "min": 1, "max": 8,
-                    "tooltip": "Re-draw steps per chunk. 3 = the Regen2K 3-step schedule "
-                               "[0.9094, 6/7, 2/3, 0]; 2 = the 2-step schedule [0.7, 0.4941, 0]; "
-                               "1 = 1-step schedule."}),
+                    "tooltip": "Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster and "
+                               "sharpens less (at the default start: [0.7, 0.494, 0])."}),
                 "start_sigma": ("FLOAT", {
                     "default": d["start_sigma"], "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "0 = the Regen2K schedule ([0.9094, 6/7, 2/3, 0] at 3 steps, or "
-                               "[0.7, 0.4941, 0] at 2 steps). Above 0 the re-draw starts at this "
-                               "sigma and follows the model's schedule down to 0 in `steps` steps."}),
+                    "tooltip": "Leave at 0 (= Regen2K; use redraw_start instead). Above 0 the "
+                               "re-draw follows the model's own schedule from this point, for "
+                               "the pre-Regen2K recipe."}),
                 "noise": (["per_chunk", "film"], {
                     "default": "per_chunk",
-                    "tooltip": "per_chunk: every chunk draws from its own first frame "
-                               "(Regen2K default). film: one noise field for the whole "
-                               "film, so the frames two chunks share get the same noise "
-                               "from both sides."}),
+                    "tooltip": "per_chunk = each piece gets its own noise (Regen2K default). "
+                               "film = one noise pattern across the whole film."}),
                 # Not named seed: ComfyUI hangs a randomize control on any
                 # widget called seed, and the seed must stay fixed.
                 "redraw_seed": ("INT", {
                     "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
-                    "tooltip": "Noise seed of the re-draw (Regen2K default: 42). Fixed: "
-                               "it does not change between runs."}),
+                    "tooltip": "Noise seed for the re-draw. Same seed, same result."}),
                 "chunk_frames": ("INT", {
                     "default": int(d["chunk_frames"]), "min": 34, "max": 1020, "step": 17,
-                    "tooltip": "Frames per time chunk, a multiple of 17. Longer chunks "
-                               "mean fewer joins but more tokens per pass (more tiles "
-                               "or more VRAM)."}),
+                    "tooltip": "Frames per piece (a multiple of 17). Longer = fewer joins "
+                               "but more VRAM. Regen2K never goes under 68."}),
                 "chunk_overlap": ("INT", {
                     "default": d["chunk_overlap"], "min": 17, "max": 1003, "step": 17,
-                    "tooltip": "Frames two chunks share and crossfade over, a multiple "
-                               "of 17, smaller than chunk_frames."}),
+                    "tooltip": "Frames two neighbouring pieces share (a multiple of 17, less "
+                               "than chunk_frames)."}),
                 "anchor_strength": ("FLOAT", {
                     "default": d["anchor_strength"], "min": 0.0, "max": 1.0, "step": 0.001,
-                    "tooltip": "How hard each chunk's first frame is pinned to what the "
-                               "previous chunk drew there. 0.999 = H3's default."}),
+                    "tooltip": "Pre-Regen2K recipe only: how firmly each piece's first frame "
+                               "follows the previous piece. 0.999 = H3's default."}),
                 "tile_overlap_px": ("INT", {
                     "default": d["tile_overlap_px"], "min": 0, "max": 512, "step": 32,
-                    "tooltip": "Overlap between spatial tiles, in pixels (128 = the "
-                               "recipe). Only matters when a chunk splits into tiles."}),
+                    "tooltip": "How much neighbouring tiles overlap, in pixels (128 = normal). "
+                               "Only matters when frames are cut into tiles."}),
                 "detail_sigma": ("FLOAT", {
                     "default": d["detail_sigma"], "min": 0.0, "max": 32.0, "step": 0.5,
-                    "tooltip": "0 = off. Above 0, keeps the 3D upscaler's large shapes "
-                               "(blurred at this many latent px) and takes only the finer "
-                               "detail from the re-draw. For tile-grid shifts, not a "
-                               "sharpness control."}),
+                    "tooltip": "0 = off. Above 0, keeps the upscaler's large shapes and takes "
+                               "only fine detail from the re-draw. A fix for tile-grid "
+                               "shifts, not a sharpness control."}),
                 "attn_chunks": ("INT", {
                     "default": d["attn_chunks"], "min": 1, "max": 16,
-                    "tooltip": "Attention split into this many head groups to save VRAM. "
-                               "Keep 4. Lower needs far more VRAM: 1 / 1 on a 32 GB card "
-                               "at 1-2 MP spills into system RAM and stalls the PC. Same "
-                               "result either way."}),
+                    "tooltip": "VRAM saver; same result either way. Keep 4: lower needs far "
+                               "more VRAM and can stall the PC."}),
                 "ffn_chunks": ("INT", {
                     "default": d["ffn_chunks"], "min": 1, "max": 16,
-                    "tooltip": "Feed-forward split into this many token groups to save "
-                               "VRAM. Keep 2 or raise it on smaller cards; 1 needs far "
-                               "more VRAM. Same result either way."}),
-                "structure_lock": ("FLOAT", {
-                    "default": d["structure_lock"], "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "0 = off. Holds the re-draw's large shapes (faces, hands, "
-                               "line work) to the source at every step, so chunks and "
-                               "tiles stop inventing and agree where they overlap; the "
-                               "re-draw still adds the fine detail. Try 0.5-1."}),
-                "lock_sigma": ("FLOAT", {
-                    "default": d["lock_sigma"], "min": 0.5, "max": 16.0, "step": 0.25,
-                    "tooltip": "What structure_lock counts as 'large', in latent cells "
-                               "(16 px each). Lower holds finer features (eyes, mouth "
-                               "shape) but leaves the re-draw less to sharpen."}),
+                    "tooltip": "VRAM saver; same result either way. Keep 2, or raise it on "
+                               "smaller cards."}),
                 "attention": (list(ATTENTION_MODES), {
                     "default": d["attention"],
                     "tooltip": ATTENTION_TIP}),
                 "chunk_join": (list(JOIN_MODES), {
-                    "default": d["chunk_join"],
+                    "default": "stepped",
                     "tooltip": JOIN_TIP}),
                 "chunking": ("BOOLEAN", {
                     "default": d["chunking"], "tooltip": CHUNKING_TIP}),
                 "tiling": ("BOOLEAN", {
                     "default": d["tiling"], "tooltip": TILING_TIP}),
-                "lock_anchor": (list(LOCK_ANCHORS), {
-                    "default": d["lock_anchor"], "tooltip": LOCK_ANCHOR_TIP}),
-                "tile_context": (list(TILE_CONTEXTS), {
-                    "default": d["tile_context"], "tooltip": TILE_CONTEXT_TIP}),
+                "redraw_start": ("FLOAT", {
+                    "default": d["redraw_start"], "min": 0.3, "max": 0.95, "step": 0.05,
+                    "tooltip": "How much the re-draw is allowed to change. 0.8 = the Regen2K "
+                               "recipe. Lower stays closer to the chain's frames: faces drift "
+                               "less, but it sharpens less. Try 0.6 if faces change."}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {
-                    "tooltip": "Sampler for the re-draw. Unwired uses euler for Regen2K. "
-                               "Multistep samplers only keep their history when a chunk "
-                               "is one tile."}),
+                    "tooltip": "Optional sampler for the re-draw. Unwired = euler, which "
+                               "Regen2K is tuned for."}),
             },
         }
 

@@ -24,7 +24,7 @@
     "Node name for S&R": "MarkdownNote"
    },
    "widgets_values": [
-    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip (put it in `ComfyUI/input`). Any size; 24 fps is what H3\n   assumes, other rates work but the soundtrack conditions the re-draw loosely.\n2. **Queue.** H3 Save Video writes it to `video/H3_upsampled` at the clip's own fps,\n   with its own soundtrack untouched (NVENC when there is a GPU). Set its `frame_gen` to x2 for\n   double the frame rate (RTX GPU + `nvidia-vfx`).\n\n### The node\n- **megapixels**: output size, aspect kept (2 = about 1920x1080).\n- **denoise**: Regen2K LoRA strength for the 3-step Euler re-draw on `[0.8, 24/35, 0.48, 0]` (0.8 is the default; 0 skips the re-draw and only enlarges).\n- **lora**: the Open-H3-Regenerate-2K LoRA (`open_h3_regenerate_2k_r256pp_bf16.safetensors` by default).\n- **tile_tokens**: 0 = auto (default): learned on this GPU run by run, starting at 70000, grown when there is room, lowered for good after running out of VRAM. A number fixes it (lower = shorter chunks, then tiles).\n- **redraw_seed**: noise seed for the Regen2K re-draw (42 by default).\n- **structure_lock**: 0 = off. Holds the re-draw to the clip's large shapes (faces, hands, line work) at every step so chunks and tiles stop inventing; try 0.5-1, higher for animation.\n- **lock_sigma**: what structure_lock counts as large, in latent cells (2 = 32 px). 1-1.5 also holds eyes and mouths on medium shots.\n- **fps** is wired from Get Video Components: H3 runs on a 24 fps clock, so for other rates **off_24_audio** retimes what the re-draw hears (retime) or conditions on silence. The output soundtrack is always the original. A 48 fps clip interpolated from a 24 fps render: upscale the 24 fps frames and use frame_gen x2 instead (half the work, exact sync).\n- **conditioning** (optional): a CLIPTextEncode of what the clip shows, typed or written by a VLM. Unwired = zeroed-out conditioning.\n- **audio_vae** wired = the re-draw pins the real soundtrack; unwired = it pins silence.\n\nMouths and motion come from the clip; only fine detail is re-drawn.\n\n**Video Frames (lean)** replaces Get Video Components: same images / audio / fps, about half the RAM, and `start_seconds`, `duration_seconds`, `frame_rate` and `resize` applied while decoding. For long clips use the file-to-file workflow instead.\n\n**Speed and joins:** `attention` sparse = ComfyUI's sparse attention (much faster on long sequences, approximate: compare faces). `chunk_join` stepped = neighbouring chunks are re-drawn together and merged after every step, so they converge on one face instead of meeting as two. `chunking` / `tiling` allow a split when the clip doesn't fit `tile_tokens` (chunks are shortened first, never under 68 frames); both off = the whole clip in one whole-frame pass, for short clips on big cards. `lock_anchor` source holds `structure_lock` to the clip itself, so the 3D upscaler's own errors are pulled back too."
+    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip. **Video Frames** picks the part to upscale (`start_seconds`, `duration_seconds`) and can convert to 24 fps.\n2. **Queue.** H3 Save Video writes the result to `video/H3_upsampled` with the original soundtrack. Set its `frame_gen` to x2 for double the frame rate (RTX card + `nvidia-vfx`).\n\n### Settings worth knowing\n- **megapixels**: output size (2 = about 1920x1080).\n- **denoise**: how strongly detail is re-drawn. 0.8 = normal, 0 = only enlarge.\n- **redraw_start**: how much the re-draw may change. 0.8 = the recipe; **0.6 if faces change** (less sharpening).\n- **redraw_steps**: 3 = the recipe; 2 = a third faster and sharpens less.\n- **tile_tokens**: leave at 0 (automatic: it learns what your GPU can take).\n- **chunk_join**: leave on `stepped`: long clips are cut into overlapping pieces that are re-drawn together, so there are no seams at the joins.\n- **chunking / tiling**: leave on. They only split the work when your GPU needs it. Both off = one pass, for short clips on big cards.\n- **attention**: `sparse` is faster on long clips but approximate; compare faces.\n- **fps** and **audio_vae** wired = lip sync is kept, also for 48 fps clips.\n- **conditioning** (optional): a text prompt describing the look. Unwired works well for most clips.\n\nFor long clips, use the file-to-file workflow: it keeps RAM low whatever the length.\n"
    ]
   },
   {
@@ -318,16 +318,12 @@
     0,
     "euler",
     42,
-    0.0,
-    2.0,
-    "source",
-    "retime",
     "dense",
-    "crossfade",
+    "stepped",
     true,
     true,
-    "none",
-    0.8
+    0.8,
+    "3 (recipe)"
    ]
   },
   {

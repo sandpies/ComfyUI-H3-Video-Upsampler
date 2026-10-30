@@ -41,22 +41,19 @@ ComfyUI uses the bundled copy, chunk by chunk, with the same checkpoint.
 
 | widget | what it does |
 |---|---|
-| `megapixels` | output size, aspect kept (2 = about 1920x1080) |
-| `denoise` | **0.8** is the default Regen2K LoRA strength (3 Euler steps on `[0.8, 24/35, 0.48, 0]`); 0 skips the re-draw and only enlarges |
-| `lora` | Open-H3-Regenerate-2K LoRA from `models/loras` (`open_h3_regenerate_2k_r256pp_bf16.safetensors` by default) |
-| `tile_tokens` | **VRAM. 0 = auto (default):** starts at what this GPU learned last time (70000 the first time), measures every chunk's real activation memory, and stores where the next run should start. It grows when there was room (at most 2x a run, aiming at 85% of the card) and drops to the budget that worked after running out of VRAM, never going back near the failing value. Learned per GPU, attention mode and low-VRAM settings, in `ComfyUI/user/htc_upsampler_memory.json`. A number fixes the budget: lower = shorter chunks (down to 68 f), then tiles |
-| `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |
-| `structure_lock` | **0 = off.** Holds the re-draw's large shapes (faces, hands, line work) to the clip's at every step, so chunks and tiles stop inventing and agree where they overlap; fine detail still comes from the re-draw. Try 0.5-1, higher for animation |
-| `lock_sigma` | What `structure_lock` counts as large, in latent cells (16 px each; 2 = 32 px). 1-1.5 also holds eyes and mouths on medium shots, with a little less sharpening |
-| `lock_anchor` | What `structure_lock` holds the large shapes to. `source` (default): the clip's own latent, enlarged by plain interpolation. Nothing is invented in it, so errors the 3D upscaler adds (a blown patch, a colour shift) are pulled back too. `upscaler`: the 3D upscaler's output |
-| `tile_context` | **Draft**, default `none`. It only matters when a chunk is cut into tiles. `global pass`: before the tiles, the chunk is re-drawn **whole-frame** at the largest size that fits `tile_tokens`, with the same Regen2K steps. The tiles then hold their large shapes to that result, so faces and layout come from a pass that saw the whole frame, and the tiles add the detail. It costs one smaller pass per tiled chunk |
-| `redraw_start` | Noise the Regen2K re-draw starts from; its 3-step shift-6 grid is rebuilt from here. **0.8 = the recipe** (`[0.8, 24/35, 0.48, 0]`). Lower keeps more of the clip: faces drift less toward the model's own idea of a face, at the cost of less sharpening. Try 0.7, then 0.6 |
-| `attention` | `dense` (default) or `sparse`: ComfyUI's built-in Model Sparse Attention (sol-attn) on every re-draw step. Much faster on long sequences (rdh measured about 4x on a 2K refine), close to dense but approximate, so compare faces before relying on it. Needs a ComfyUI recent enough to have the node; otherwise it runs dense |
-| `chunk_join` | `crossfade` (default): every chunk is re-drawn on its own and the 17 frames neighbours share are blended. `stepped`: the chunks are re-drawn **together**, the way spatial tiles are. After each of the re-draw's steps, the frames two chunks share are merged into one state before either takes the next step, starting from one film-wide noise field. Two chunks then converge on one face instead of meeting as two, and a chunk's last step (which tends to come out off-tone) counts least. Every chunk is still drawn from the source, so nothing accumulates along the film. Same compute, one sampler call per chunk (or tile) per step. Chunks that must be tiled step together too: every tile of every chunk is merged after each step, so the film is one grid in time and space, and VRAM stays at one tile's worth. Out of VRAM, it steps again with smaller tiles; with `tiling` off it falls back to crossfade |
-| `chunking` / `tiling` | On (default) means a split is **allowed** when the clip doesn't fit `tile_tokens`; neither forces one. Chunking cuts time into 102-frame chunks (never under 68: Regen2K's 3 steps from 0.8 invent on short pieces). Tiling cuts space, and only once even 68-frame chunks don't fit, because a tile sees part of the frame and that is where invention comes from. **Both off: the whole clip in one whole-frame pass**, with no joins and no seams, for short clips on big cards (VRAM grows with length). Chunking off on a clip over 4x `tile_tokens` (about 18 s at 2 MP) chunks anyway; tiling off never tiles, so running out of VRAM is an error that says what to change |
-| `fps` (optional input) | The clip's frame rate, from Get Video Components (wired in the example workflow). Unwired: 24 |
-| `off_24_audio` | Only when `fps` isn't 24: what the re-draw hears. `retime` (default) slows or speeds the soundtrack by fps/24 so it lines up with the frames; `silence`; `as_is` (out of sync, the old behaviour). The output soundtrack is always the original |
-| `conditioning` (optional input) | A CLIPTextEncode (H3 text encoder) of what the clip shows. Unwired: zeroed-out conditioning. See *Guiding the re-draw* |
+| `megapixels` | Output size, shape kept (2 = about 1920x1080) |
+| `denoise` | How strongly the Regen2K LoRA re-draws detail. **0.8** = normal; 0 = no re-draw, only enlarge |
+| `lora` | The Regen2K LoRA from `models/loras` (`open_h3_regenerate_2k_r256pp_bf16.safetensors`) |
+| `tile_tokens` | How much work goes to the GPU at once. **0 = automatic (recommended):** it learns what your card can take and remembers it for the next run (in `ComfyUI/user/htc_upsampler_memory.json`). A number fixes it: lower uses less VRAM by cutting the clip into shorter pieces (never under 68 frames) and then tiles |
+| `sampler_name` | Keep `euler`: Regen2K is tuned for it |
+| `redraw_seed` | Noise seed for the re-draw (42). Same seed, same result |
+| `attention` | `dense` (default) or `sparse`: ComfyUI's sparse attention, much faster on long clips but approximate, so compare faces. Runs dense on a ComfyUI without it |
+| `chunk_join` | How the overlapping pieces of a long clip are joined. **`stepped` (default):** all pieces, and all tiles when a frame has to be tiled, are re-drawn together and merged after every step, so faces don't change at a join and VRAM stays at one piece's worth. `crossfade`: each piece on its own, overlaps blended (the old way; a face can shift at a join) |
+| `chunking` / `tiling` | On (default) = the work may be split when it's too much for the GPU; neither forces a split. Chunking cuts the clip into overlapping pieces of about 4 s; tiling also cuts frames into tiles, only when even a short piece doesn't fit. **Both off = the whole clip in one pass**, for short clips on big cards. With tiling off, running out of VRAM stops with a message saying what to change |
+| `redraw_start` | How much the re-draw may change. **0.8 = the Regen2K recipe.** Lower stays closer to your clip: faces drift less, at the cost of less sharpening. **0.6** is a good start if faces change |
+| `redraw_steps` | **3 (recipe)** or **2**: a third faster and sharpens less. Compare side by side |
+| `fps` (optional input) | The clip's frame rate (from Video Frames). Needed for lip sync when the clip isn't 24 fps: what the re-draw hears is retimed to match. The output soundtrack is always the original |
+| `conditioning` (optional input) | A text prompt (CLIPTextEncode, H3 text encoder) describing the clip. Unwired works well for most clips. See *Guiding the re-draw* |
 
 The recipe: 102-frame chunks sharing 17, 70000-token tiles with 128 px overlap,
 fresh noise per chunk, the soundtrack pinned clean.
@@ -96,7 +93,7 @@ The file node never holds the frames:
    (NVENC, keyframes on cuts, `frame_gen`).
 
 RAM stays at a few GB however long the film is. The frame rate and
-soundtrack come from the file, so `off_24_audio` always knows the real rate.
+soundtrack come from the file, so lip sync always uses the real rate.
 Widgets are the IMAGE node's, plus H3 Save Video's `frame_gen`, `codec`,
 `quality` and `filename_prefix`.
 
@@ -112,7 +109,7 @@ Two more widgets:
 - **`reuse_encoded`** (on): the encoded clip (about 100 MB a minute) is kept
   in ComfyUI's temp folder, keyed to the file's content, trim, crop,
   `frame_rate` and VAE. The next run on the same clip skips reading and
-  encoding, which helps A/B runs of `structure_lock` or seeds. Up to 4 clips
+  encoding, which helps A/B runs of settings or seeds. Up to 4 clips
   are kept, and the temp folder is cleared when ComfyUI starts.
 
 A VIDEO trimmed or cropped upstream is read with core's own rules (trim
@@ -163,22 +160,20 @@ for whole films, the file-to-file node avoids the IMAGE altogether.
 
 ## Guiding the re-draw
 
-The re-draw starts from sigma 0.8, which is mostly noise. With zeroed-out
-conditioning it only has the 3D-upscaled frames to go on. Realistic footage
-mostly holds up, but faces drift slightly, and animation gets extra lines,
-texture and shading. Two controls help:
+The re-draw starts from mostly noise and, with no prompt, only has the
+3D-upscaled frames to go on. Realistic footage mostly holds up, but faces can
+drift slightly, and animation can get extra lines and shading. Two controls
+help:
 
-- **`structure_lock`** keeps the layout from the source. Each step's
-  clean-frame prediction is pulled toward the upscaled clip at scales above
-  about 32 px. The re-draw can still sharpen but can't move or reshape things.
-  It acts on every tile and chunk, so two chunks crossfading over the same 17
-  frames also stop disagreeing. Start at 0.5. For animation try 0.75-1, and
-  lower its blur by setting HTC Upsample Settings' `lock_sigma` below 2 when
-  small features such as eyes still drift.
+- **`redraw_start`** sets how much the re-draw may change. Side-by-side tests
+  traced face drift to the re-draw itself (not the upscaler, seed, LoRA
+  strength or prompt), and starting at **0.6** instead of 0.8 kept faces
+  closest to the source, with a little less sharpening. `redraw_steps` 2
+  sharpens less again.
 - **`conditioning`** says what the clip is. Wire `CLIPTextEncode` with the H3
   text encoder and either type a caption or feed it a VLM's (Qwen-VL, Florence,
   etc.) description of a few frames. Every spatial tile hears the whole prompt,
-  so when a chunk splits into tiles a prompt naming objects ("a woman holding a
+  so when a frame splits into tiles a prompt naming objects ("a woman holding a
   cup") can make each tile draw them. Describe the **look** and keep objects
   general: *"2D anime, flat cel shading, clean black line art, no film grain"*,
   or *"live-action, natural skin texture, shallow depth of field"*.
@@ -189,8 +184,8 @@ H3 places every frame 1/24 s after the last and lays the soundtrack under them
 on that clock. A 60 s clip at 48 fps is 2,880 frames, which H3 reads as 120 s.
 Without `fps` wired, the real soundtrack covered only the first half, at the
 wrong speed, and the second half heard silence. The re-draw then pulled mouths
-toward the wrong syllables. Wire `fps` and the default `off_24_audio=retime`
-stretches what the re-draw hears to match.
+toward the wrong syllables. Wire `fps` and what the re-draw hears is
+stretched to match.
 
 If the 48 fps file was interpolated from a 24 fps render, it's better to
 upscale the original 24 fps frames (drop every other frame) and turn on

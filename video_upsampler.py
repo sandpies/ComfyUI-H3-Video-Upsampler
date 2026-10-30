@@ -21,20 +21,17 @@ does the rest itself:
 5. decodes, trims the padding off, and hands back the frames with the
    original soundtrack untouched.
 
-`structure_lock` holds the re-draw's large shapes to the source's at every
-step (tiled_upsampler.structure_lock_fn): 0 is the recipe as it was.
-`lock_sigma` is what counts as large, in latent cells (16 px each).
+`redraw_start` and `redraw_steps` rebuild Regen2K's shift-6 grid
+(tiled_upsampler.regen2k_sigmas): a lower start keeps faces closer to the
+clip, 2 steps sharpen less. 0.8 and 3 are the recipe.
 
 H3 puts every frame 1/24 s after the last, and the soundtrack under them on
 that clock. A 48 fps clip of 60 s is 2880 frames, which H3 reads as 120 s:
 the real 60 s of audio would sit under the first half, twice too fast, and
 the second half would hear silence -- the re-draw then pulls the mouths
-toward the wrong syllables. With `fps` wired and not 24, `off_24_audio`
-decides what the re-draw hears instead (the soundtrack that comes OUT is
-always the original, untouched): `retime` slows or speeds the soundtrack by
-fps / 24 so each syllable sits under its own frame (pitch moves with it),
-`silence` conditions on silence and leaves the mouths to the frames (and to
-structure_lock), `as_is` is the old behaviour.
+toward the wrong syllables. With `fps` wired and not 24, what the re-draw
+hears is retimed by fps / 24 so each syllable sits under its own frame (pitch
+moves with it); the soundtrack that comes OUT is always the original.
 
 `tile_tokens` is the one thing the chain's recipe fixes that a smaller card
 needs to move: the largest sequence one tile forward may carry. Lower means
@@ -58,7 +55,7 @@ REGEN2K_DEFAULT_LORA = "open_h3_regenerate_2k_r256pp_bf16.safetensors"
 REGEN2K_DEFAULT_STRENGTH = 0.8
 REGEN2K_SEED = 42
 REGEN2K_TEXT_DIM = 5120
-OFF_24_AUDIO = ("retime", "silence", "as_is")
+REDRAW_STEPS = ("3 (recipe)", "2")
 
 
 def zero_out_cond():
@@ -469,91 +466,70 @@ class HTCVideoUpsampler:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": (
-                    "The H3 model for the re-draw: wire UNETLoader with "
-                    "minimax_h3_fl2va_pruned_int8_convrot.safetensors.")}),
+                    "The H3 model (UNETLoader: minimax_h3_fl2va_pruned_int8_convrot).")}),
                 "vae": ("VAE", {"tooltip": "The H3 video VAE."}),
                 "images": ("IMAGE", {"tooltip": (
-                    "The clip's frames (Get Video Components). Any size; fitted to a "
-                    "multiple of 32 px.")}),
+                    "The clip's frames. Any size: it's fitted to a multiple of 32 px.")}),
                 "upscale_model": (_tu.choices(), {
-                    "tooltip": f"From models/{_tu.FOLDER}. Uses {_tu.UPSCALER_FILE}."}),
+                    "tooltip": (f"The 3D latent upscaler, from models/{_tu.FOLDER} "
+                                f"({_tu.UPSCALER_FILE}).")}),
                 "megapixels": ("FLOAT", {
                     "default": _tu.MEGAPIXELS, "min": 0.1, "max": 16.0, "step": 0.05,
-                    "tooltip": "Output size as area, aspect kept (1 MP = 1024 x 1024)."}),
+                    "tooltip": ("Output size. 2 = about 1920x1080. The shape of the clip "
+                                "is kept.")}),
                 "denoise": ("FLOAT", {
                     "default": REGEN2K_DEFAULT_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.005,
-                    "tooltip": ("Regen2K LoRA strength for the 3-step Euler re-draw "
-                                "(0.8 is the default; 0 skips the re-draw and only enlarges).")}),
+                    "tooltip": ("How strongly the Regen2K LoRA re-draws detail. 0.8 = normal. "
+                                "0 = no re-draw, the clip is only enlarged.")}),
                 "lora": (loras, {
                     "default": REGEN2K_DEFAULT_LORA,
-                    "tooltip": ("Open-H3-Regenerate-2K LoRA from models/loras "
-                                f"(default: {REGEN2K_DEFAULT_LORA}).")}),
+                    "tooltip": f"The Regen2K LoRA, from models/loras ({REGEN2K_DEFAULT_LORA})."}),
                 "tile_tokens": ("INT", {
                     "default": 0, "min": 0, "max": 1048576, "step": 1024,
-                    "tooltip": ("VRAM. 0 = auto: starts at what this GPU learned last time "
-                                f"({_tu.TOKEN_BUDGET} the first time), measures every chunk, and "
-                                "stores where the next run should start -- grown when there was "
-                                "room, lowered for good after running out. A number = that "
-                                "fixed budget: the largest sequence one forward may carry; lower "
-                                "means shorter chunks (down to 68 f) then tiles.")}),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                    "tooltip": ("How much work goes to the GPU at once. 0 = automatic (recommended): "
+                                "it learns what your card can take and remembers it for the next "
+                                "run. A number fixes it: lower uses less VRAM, by cutting the clip "
+                                "into shorter pieces and then tiles.")}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {
+                    "default": "euler", "tooltip": "Keep euler: Regen2K is tuned for it."}),
                 # Not named seed: ComfyUI hangs a randomize control on any
                 # widget called seed, and the default 42 should stay fixed.
                 "redraw_seed": ("INT", {
                     "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
-                    "tooltip": "Noise seed for the Regen2K re-draw (default: 42)."}),
-                "structure_lock": ("FLOAT", {
-                    "default": _tu.STRUCTURE_LOCK, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": ("0 = off. Holds the re-draw's large shapes (faces, hands, "
-                                "line work) to the source clip at every step, so chunks and "
-                                "tiles stop inventing and agree where they overlap; the "
-                                "re-draw still adds the fine detail. Try 0.5-1, higher for "
-                                "animation.")}),
-                "lock_sigma": ("FLOAT", {
-                    "default": _tu.LOCK_SIGMA, "min": 0.5, "max": 16.0, "step": 0.25,
-                    "tooltip": ("What structure_lock counts as 'large', in latent cells (16 px "
-                                "each; 2 = 32 px). Lower (1-1.5) also holds eyes and mouths on "
-                                "medium shots, but leaves the re-draw less to sharpen.")}),
-                "lock_anchor": (list(_tu.LOCK_ANCHORS), {
-                    "default": "source", "tooltip": _tu.LOCK_ANCHOR_TIP}),
-                "off_24_audio": (list(OFF_24_AUDIO), {
-                    "default": OFF_24_AUDIO[0],
-                    "tooltip": ("Only with fps wired and not 24: what the re-draw hears. retime = "
-                                "the soundtrack slowed/sped by fps/24 so it lines up with the "
-                                "frames H3 sees at 24 fps; silence = no sound, the mouths come "
-                                "from the frames; as_is = the old behaviour (out of sync). The "
-                                "output soundtrack is always the original.")}),
+                    "tooltip": "Noise seed for the re-draw. Same seed, same result."}),
                 "attention": (list(_tu.ATTENTION_MODES), {
                     "default": "dense", "tooltip": _tu.ATTENTION_TIP}),
                 "chunk_join": (list(_tu.JOIN_MODES), {
-                    "default": "crossfade", "tooltip": _tu.JOIN_TIP}),
+                    "default": "stepped", "tooltip": _tu.JOIN_TIP}),
                 "chunking": ("BOOLEAN", {"default": True, "tooltip": _tu.CHUNKING_TIP}),
                 "tiling": ("BOOLEAN", {"default": True, "tooltip": _tu.TILING_TIP}),
-                "tile_context": (list(_tu.TILE_CONTEXTS), {
-                    "default": "none", "tooltip": _tu.TILE_CONTEXT_TIP}),
                 "redraw_start": ("FLOAT", {
                     "default": 0.8, "min": 0.3, "max": 0.95, "step": 0.05,
-                    "tooltip": ("Noise the Regen2K re-draw starts from (its 3-step grid is "
-                                "rebuilt from here). 0.8 = the recipe. Lower keeps more of the "
-                                "clip: faces drift less toward the model's own idea of a face, "
-                                "at the cost of less sharpening. Try 0.7, then 0.6.")}),
+                    "tooltip": ("How much the re-draw is allowed to change. 0.8 = the Regen2K "
+                                "recipe. Lower stays closer to your clip: faces drift less, but "
+                                "it sharpens less. 0.6 is a good place to start if faces "
+                                "change.")}),
+                "redraw_steps": (list(REDRAW_STEPS), {
+                    "default": REDRAW_STEPS[0],
+                    "tooltip": ("Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster and "
+                                "sharpens less; compare side by side if 3 looks oversharpened.")}),
             },
             "optional": {
                 "conditioning": ("CONDITIONING", {"tooltip": (
-                    "What the clip shows, from the H3 text encoder (CLIPTextEncode), typed "
-                    "or written by a VLM. Unwired: zeroed-out conditioning. References and "
-                    "keyframes in it are dropped. Every tile hears the whole prompt, so "
-                    "describe the look (\"2D anime, flat cel shading, clean line art\") "
-                    "more than the objects.")}),
-                "audio": ("AUDIO", {"tooltip": "The clip's soundtrack. Passed through untouched."}),
+                    "Optional: a text prompt (CLIPTextEncode with the H3 text encoder) "
+                    "describing the clip. Describe the look (\"2D anime, flat cel shading, "
+                    "clean line art\") more than the objects. Unwired = no prompt, which "
+                    "works well for most clips.")}),
+                "audio": ("AUDIO", {"tooltip": (
+                    "The clip's soundtrack. The re-draw listens to it to keep lip sync; "
+                    "the output soundtrack is the original, untouched.")}),
                 "fps": ("FLOAT", {"forceInput": True, "tooltip": (
-                    "The clip's frame rate (Get Video Components fps). Unwired: taken as 24. "
-                    "H3 works on a 24 fps clock; see off_24_audio. For a 48 fps clip made by "
-                    "interpolating a 24 fps render, upscaling the 24 fps frames and using H3 "
-                    "Save Video's frame_gen x2 is faster and keeps sync exactly.")}),
+                    "The clip's frame rate (from Video Frames). Needed for lip sync when the "
+                    "clip isn't 24 fps. Unwired = 24. Tip: for 48 fps clips, take the frames "
+                    "at 24 fps and use Save Video's frame_gen x2: half the work, exact sync.")}),
                 "audio_vae": ("VAE", {"tooltip": (
-                    "The H3 audio VAE. With it, the re-draw pins the real "
-                    "soundtrack (best at 24 fps); without it, silence.")}),
+                    "The H3 audio VAE. Lets the re-draw hear the soundtrack, which keeps "
+                    "mouths in sync. Without it the re-draw hears silence.")}),
             },
         }
 
@@ -562,17 +538,15 @@ class HTCVideoUpsampler:
     FUNCTION = "run"
     CATEGORY = "video/upscale"
     DESCRIPTION = (
-        "Upsamples a finished clip with Open-H3-Regenerate-2K: H3 3D latent upscale, then "
-        "3 Euler steps on [0.8, 24/35, 0.48, 0] with zeroed-out conditioning (or the wired "
-        "conditioning's text) and the soundtrack pinned clean (noise=per_chunk, seed 42). "
-        "structure_lock holds the re-draw to the source's large shapes; tile_tokens lets a "
-        "smaller card shorten chunks or cut more tiles.")
+        "Upscales a finished clip to about 2 MP: H3's 3D latent upscaler enlarges it, then "
+        "the Regen2K LoRA re-draws fine detail in a few steps. Long clips are cut into "
+        "overlapping pieces that are re-drawn together, so there are no seams, and it adapts "
+        "to your GPU's memory by itself.")
 
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
-            structure_lock=0.0, lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0],
-            attention="dense", chunk_join="crossfade", chunking=True, tiling=True,
-            tile_context="none", redraw_start=0.8, lock_anchor="source", audio=None,
+            attention="dense", chunk_join="stepped", chunking=True, tiling=True,
+            redraw_start=0.8, redraw_steps=REDRAW_STEPS[0], audio=None,
             audio_vae=None, conditioning=None, fps=None):
         check_vae(vae)
         n = int(images.shape[0])
@@ -586,9 +560,8 @@ class HTCVideoUpsampler:
         del frames
         vid, report = redraw(
             model, video, n, (src_w, src_h), upscale_model, megapixels, denoise, lora,
-            tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
-            audio, audio_vae, conditioning, fps, attention, chunk_join, chunking, tiling,
-            lock_anchor, tile_context, redraw_start)
+            tile_tokens, sampler_name, redraw_seed, audio, audio_vae, conditioning, fps,
+            attention, chunk_join, chunking, tiling, redraw_start, redraw_steps)
         img = decode_streamed(vae.decode, vid, n)
         del vid
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
@@ -609,10 +582,9 @@ def check_vae(vae):
 
 
 def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
-           tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
-           audio, audio_vae, conditioning, fps, attention="dense", chunk_join="crossfade",
-           chunking=True, tiling=True, lock_anchor="source", tile_context="none",
-           redraw_start=0.8):
+           tile_tokens, sampler_name, redraw_seed, audio, audio_vae, conditioning, fps,
+           attention="dense", chunk_join="stepped", chunking=True, tiling=True,
+           redraw_start=0.8, redraw_steps=REDRAW_STEPS[0]):
     """Steps 2-4 for a clip already encoded: `video` is the H3 video latent of
     `n` frames padded to `valid_length(n)`. -> (upsampled video latent, report)."""
     import comfy.nested_tensor as nt
@@ -622,8 +594,9 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
     from comfy_extras.nodes_minimax_h3 import temporal_shape
 
     _tu.register_folder()
-    r2k_sigmas = (_tu.REGEN2K_SIGMAS if abs(float(redraw_start) - 0.8) < 1e-6
-                  else _tu.regen2k_sigmas(float(redraw_start)))
+    n_steps = int(str(redraw_steps).split()[0])
+    r2k_sigmas = (_tu.REGEN2K_SIGMAS if abs(float(redraw_start) - 0.8) < 1e-6 and n_steps == 3
+                  else _tu.regen2k_sigmas(float(redraw_start), n_steps))
     w, h = int(video.shape[4]) * _tu.SPATIAL, int(video.shape[3]) * _tu.SPATIAL
     length = valid_length(n)
     _, latent_t, audio_t = temporal_shape(length)
@@ -632,12 +605,11 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
                            f"latent steps, expected {latent_t}")
     clip_fps = float(fps) if fps else float(H3_FPS)
     off_24 = abs(clip_fps - H3_FPS) > 1e-3
-    mode = str(off_24_audio or OFF_24_AUDIO[0]) if off_24 else "as_is"
+    mode = "retime" if off_24 else "as_is"
     if off_24:
-        print(f"[{TAG}] WARNING: {clip_fps:g} fps clip; H3 reads every frame as 1/{H3_FPS} s, "
-              f"so {n} frames span {n / H3_FPS:.1f} s on its clock vs {n / clip_fps:.1f} s "
-              f"of soundtrack. off_24_audio={mode}.", flush=True)
-    if audio is not None and audio_vae is not None and mode != "silence":
+        print(f"[{TAG}] {clip_fps:g} fps clip: H3 reads every frame as 1/{H3_FPS} s, so what "
+              f"the re-draw hears is retimed x{clip_fps / H3_FPS:g} to stay in sync.", flush=True)
+    if audio is not None and audio_vae is not None:
         import comfy.audio
         wav = audio["waveform"]
         vsr = getattr(audio_vae, "audio_sample_rate", 44100)
@@ -649,9 +621,6 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
         audio_note = "conditioned on the soundtrack" + (
             f" retimed x{clip_fps / H3_FPS:g} ({clip_fps:g} fps)" if mode == "retime"
             else f" out of sync ({clip_fps:g} fps)" if off_24 else "")
-    elif off_24 and mode == "silence" and audio is not None and audio_vae is not None:
-        a_lat = torch.zeros((1, 32, 2, audio_t), dtype=video.dtype)
-        audio_note = f"conditioned on silence (off_24_audio=silence, {clip_fps:g} fps)"
     else:
         a_lat = torch.zeros((1, 32, 2, audio_t), dtype=video.dtype)
         audio_note = "conditioned on silence (no audio_vae + audio)"
@@ -663,8 +632,6 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
     else:
         cond = zero_out_cond()
         cond_note = "zeroed-out conditioning"
-    lock = max(0.0, min(1.0, float(structure_lock or 0.0)))
-    lock_sig = max(0.5, float(lock_sigma or _tu.LOCK_SIGMA))
     model = model.clone() if hasattr(model, "clone") else model
     eff_lora = str(lora or "").strip()
     if not eff_lora or eff_lora == "None":
@@ -692,7 +659,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
     sig_list = [round(float(s), 4) for s in r2k_sigmas]
     print(f"[{TAG}] {n} frames at {src_size[0]}x{src_size[1]} -> H3 "
           f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}, "
-          f"{cond_note}, structure lock {lock:g} at {lock_sig:g} cells; "
+          f"{cond_note}; "
           f"tile budget {int(tile_tokens) or 'auto'}; regen2k ({lora_tag}, "
           f"sigmas {sig_list})", flush=True)
     _cd = _tu.CHAIN_DEFAULTS
@@ -711,9 +678,8 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
                            budget=int(tile_tokens), steps=steps, start_sigma=0.0,
                            overlap_px=overlap_px, detail_sigma=0.0,
                            seed=int(redraw_seed), noise="per_chunk",
-                           sigmas=r2k_sigmas, structure_lock=lock, lock_sigma=lock_sig,
-                           attention=attention, chunk_join=chunk_join, chunking=chunking,
-                           tiling=tiling, lock_anchor=lock_anchor, tile_context=tile_context)
+                           sigmas=r2k_sigmas, attention=attention, chunk_join=chunk_join,
+                           chunking=chunking, tiling=tiling)
     _tu._free(model)
     if _tu._device().type == "cuda":
         _tu._free_all_gpu()
@@ -721,11 +687,9 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
     del out
     report = (f"{n} frames {src_size[0]}x{src_size[1]} -> "
               f"{int(vid.shape[4]) * _tu.SPATIAL}x{int(vid.shape[3]) * _tu.SPATIAL}"
-              f", regen2k ({lora_tag}, {steps} steps, {cond_note}"
-              f", structure lock {lock:g} at {lock_sig:g} cells)"
+              f", regen2k ({lora_tag}, {steps} steps from {float(r2k_sigmas[0]):g}, {cond_note})"
               f", {audio_note}, attention {attention}, chunk_join {chunk_join}"
               f", chunking {'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}"
-              f", lock anchor {lock_anchor}, tile context {tile_context}"
               f", tile budget {int(tile_tokens) or 'auto'}, overlap {overlap_px}px")
     print(f"[{TAG}] {report}", flush=True)
     return vid, report
@@ -739,32 +703,31 @@ class HTCVideoUpsamplerToFile:
     def INPUT_TYPES(cls):
         base = HTCVideoUpsampler.INPUT_TYPES()
         req = {"video": ("VIDEO", {"tooltip": (
-            "The clip (Load Video). Read and encoded a chunk at a time; its frame rate and "
-            "soundtrack come from the file.")})}
+            "The clip (Load Video or Load Video (path)). It's read a piece at a time, so "
+            "any length works; frame rate and sound come from the file.")})}
         for k, v in base["required"].items():
             if k != "images":
                 req[k] = v
         try:
             from .save_video import CPU_CODECS, FRAME_GEN, QUALITY
             req["frame_gen"] = (list(FRAME_GEN), {"default": "off", "tooltip": (
-                "RTX frame generation while saving: x2 turns 24 fps into 48 (RTX card + "
-                "nvidia-vfx).")})
-            req["codec"] = (["auto"] + list(CPU_CODECS), {"default": "auto"})
-            req["quality"] = (list(QUALITY), {"default": "max"})
+                "Doubles the frame rate while saving (24 -> 48 fps) with RTX frame "
+                "generation. Needs an RTX card and nvidia-vfx.")})
+            req["codec"] = (["auto"] + list(CPU_CODECS), {"default": "auto", "tooltip": (
+                "auto = the GPU encoder when there is one, otherwise the CPU.")})
+            req["quality"] = (list(QUALITY), {"default": "max", "tooltip": (
+                "File quality. Lower = smaller file.")})
         except Exception:  # noqa: BLE001 -- PyAV missing: the node fails at run time
             pass
         req["filename_prefix"] = ("STRING", {"default": "video/H3_upsampled"})
         req["frame_rate"] = (list(FRAME_RATES), {"default": FRAME_RATES[0], "tooltip": (
-            "source = every frame of the file. 24 = re-timed to H3's own rate on read "
-            "(nearest frame: dropped above 24, repeated below), so the soundtrack lines "
-            "up exactly and a 48 fps clip costs half the re-draw. Set frame_gen x2 to "
-            "save 48 again.")})
+            "source = keep every frame. 24 = convert to H3's own 24 fps while reading: "
+            "lip sync is exact and a 48 fps clip is half the work. Use frame_gen x2 to "
+            "get 48 fps back.")})
         req["reuse_encoded"] = ("BOOLEAN", {"default": True, "tooltip": (
-            "Keep the encoded clip (about 100 MB a minute) in ComfyUI's temp folder, "
-            "keyed to the file's content, trim, crop, frame_rate and VAE, so the next "
-            "run on the same clip skips reading and encoding. The temp folder is "
-            "cleared when ComfyUI starts.")})
-        req["redraw_start"] = req.pop("redraw_start")   # last: older widgets keep their slots
+            "Remember the prepared clip (about 100 MB a minute, in ComfyUI's temp "
+            "folder), so re-running the same clip with other settings starts faster. "
+            "Cleared when ComfyUI restarts.")})
         opt = {k: v for k, v in base["optional"].items()
                if k in ("audio_vae", "conditioning")}
         return {"required": req, "optional": opt,
@@ -776,16 +739,14 @@ class HTCVideoUpsamplerToFile:
     CATEGORY = "video/upscale"
     OUTPUT_NODE = True
     DESCRIPTION = (
-        "H3 Video Upsampler from a video file straight to an MP4: the clip is read, "
-        "encoded, re-drawn, decoded and saved a chunk at a time, so RAM stays flat however "
-        "long the film is. Same re-draw as the IMAGE node; the frame rate and soundtrack "
-        "come from the file.")
+        "The upsampler from a video file straight to an MP4. It works a piece at a time, "
+        "so RAM stays low however long the clip is. Same result as the IMAGE node; frame "
+        "rate and sound come from the file.")
 
     def run(self, video, model, vae, upscale_model, megapixels, denoise, lora, tile_tokens,
-            sampler_name, redraw_seed=REGEN2K_SEED, structure_lock=0.0,
-            lock_sigma=_tu.LOCK_SIGMA, lock_anchor="source", off_24_audio=OFF_24_AUDIO[0],
-            attention="dense", chunk_join="crossfade", chunking=True, tiling=True,
-            tile_context="none", redraw_start=0.8, frame_gen="off",
+            sampler_name, redraw_seed=REGEN2K_SEED, attention="dense",
+            chunk_join="stepped", chunking=True, tiling=True, redraw_start=0.8,
+            redraw_steps=REDRAW_STEPS[0], frame_gen="off",
             codec="auto", quality="max", filename_prefix="video/H3_upsampled",
             frame_rate=FRAME_RATES[0], reuse_encoded=True,
             audio_vae=None, conditioning=None, prompt=None, extra_pnginfo=None):
@@ -841,9 +802,8 @@ class HTCVideoUpsamplerToFile:
               flush=True)
         vid, report = redraw(
             model, lat, n, src_size, upscale_model, megapixels, denoise, lora,
-            tile_tokens, sampler_name, redraw_seed, structure_lock, lock_sigma, off_24_audio,
-            audio, audio_vae, conditioning, fps, attention, chunk_join, chunking, tiling,
-            lock_anchor, tile_context, redraw_start)
+            tile_tokens, sampler_name, redraw_seed, audio, audio_vae, conditioning, fps,
+            attention, chunk_join, chunking, tiling, redraw_start, redraw_steps)
         del lat
         out_w, out_h = int(vid.shape[4]) * _tu.SPATIAL, int(vid.shape[3]) * _tu.SPATIAL
         res = _sv.encode_stream(decode_slices(vae.decode, vid, n), n, out_w, out_h, fps,
