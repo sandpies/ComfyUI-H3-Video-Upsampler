@@ -811,7 +811,181 @@ class HTCVideoUpsamplerToFile:
         print(f"[{TAG}] {report}", flush=True)
         return {"ui": res["ui"], "result": (_video, path, report)}
 
+
+# --- frames for IMAGE graphs ------------------------------------------------
+#
+# Core's Load Video is already cheap -- a VIDEO is a reference to the file --
+# but Get Video Components decodes every frame to float32 into a list and then
+# stacks it (twice the clip for a moment), with no way to take less. This node
+# replaces that step: the window, the frame rate and the size are applied while
+# decoding, so a dropped frame never reaches RAM; frames are held as 8 bits
+# (16-bit floats for deeper sources) and filled into the float32 IMAGE once,
+# so the peak is about 1.25x the output instead of 2x or more.
+
+RESIZE_MODES = ("none", "megapixels", "long edge")
+FRAME_BATCH = 32            # frames decoded, resized and stored per step
+
+
+def resize_target(w, h, mode, value, even=2):
+    """(w, h) after `resize`: area to `value` megapixels or the long edge to
+    `value` px, aspect kept, never enlarged, both edges on a multiple of 2."""
+    if mode == "none" or float(value) <= 0.0:
+        return w, h
+    if mode == "megapixels":
+        scale = math.sqrt(float(value) * 1048576.0 / float(w * h))
+    else:
+        scale = float(value) / float(max(w, h))
+    scale = min(1.0, scale)
+    return (max(even, int(round(w * scale / even)) * even),
+            max(even, int(round(h * scale / even)) * even))
+
+
+def _store(batch, size):
+    """A [k, H, W, 3] uint8 or float32 batch, resized to `size` (w, h) when it
+    differs, as compact storage: uint8 stays uint8, deeper frames as float16."""
+    w, h = size
+    if (int(batch.shape[2]), int(batch.shape[1])) != (w, h):
+        x = _to_float(batch).movedim(-1, 1)
+        x = torch.nn.functional.interpolate(x, size=(h, w), mode="bicubic",
+                                            align_corners=False, antialias=True).clamp_(0, 1)
+        x = x.movedim(1, -1)
+        return (x * 255.0).round_().to(torch.uint8) if batch.dtype == torch.uint8 else x.half()
+    return batch if batch.dtype == torch.uint8 else batch.half()
+
+
+def frames_to_image(parts):
+    """Stored batches -> one float32 IMAGE, each batch freed as it is copied."""
+    n = sum(int(p.shape[0]) for p in parts)
+    first = parts[0]
+    out = torch.empty((n, int(first.shape[1]), int(first.shape[2]), 3), dtype=torch.float32)
+    at = 0
+    while parts:
+        p = parts.pop(0)
+        k = int(p.shape[0])
+        out[at:at + k] = p.float().div_(255.0) if p.dtype == torch.uint8 else p.float()
+        at += k
+        del p
+    return out
+
+
+class HTCVideoFrames:
+    """Get Video Components, lean: a window, a frame rate and a size, applied
+    while decoding."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO", {"tooltip": "From Load Video (or any VIDEO)."}),
+                "start_seconds": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01,
+                    "tooltip": "Skip this much of the video first."}),
+                "max_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 1000000,
+                    "tooltip": "Stop after this many frames (counted after frame_rate). 0 = to the end."}),
+                "frame_rate": (list(FRAME_RATES), {
+                    "default": FRAME_RATES[0],
+                    "tooltip": ("source = every frame. 24 = re-timed to H3's own rate while "
+                                "decoding (nearest frame: dropped above 24, repeated below); "
+                                "the duration and the soundtrack's sync are kept.")}),
+                "resize": (list(RESIZE_MODES), {
+                    "default": "none",
+                    "tooltip": ("Shrink while decoding, aspect kept, never enlarging: to "
+                                "resize_value megapixels, or the long edge to resize_value px.")}),
+                "resize_value": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 16384.0, "step": 0.01,
+                    "tooltip": "Megapixels (resize = megapixels) or pixels (resize = long edge)."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "VIDEO")
+    RETURN_NAMES = ("images", "audio", "fps", "frame_count", "video")
+    FUNCTION = "run"
+    CATEGORY = "video/upscale"
+    DESCRIPTION = (
+        "Get Video Components without the RAM bill: start, max_frames, a 24 fps re-time and a "
+        "resize are applied while decoding, so skipped frames are never held, and the frames "
+        "are filled into the IMAGE once (peak about 1.25x the output).")
+
+    def run(self, video, start_seconds=0.0, max_frames=0, frame_rate=FRAME_RATES[0],
+            resize="none", resize_value=1.0):
+        import itertools
+        import numpy as np
+        import comfy.model_management as mm
+
+        to_24 = str(frame_rate) != FRAME_RATES[0]
+        start_s = max(0.0, float(start_seconds))
+        limit = int(max_frames) if int(max_frames) > 0 else None
+        src = _video_file(video)
+        if src is not None:
+            source, start, duration, crop = src
+            src_fps = float(video.get_frame_rate())
+            fps = float(H3_FPS) if to_24 else src_fps
+            if duration and start_s >= duration:
+                raise ValueError(f"{TAG}: start_seconds {start_s:g} is past the video's "
+                                 f"{duration:g} s")
+            w_start = start + start_s
+            w_dur = max(0.0, duration - start_s) if duration else 0.0
+            frames = decode_frames(video.get_stream_source(), w_start, w_dur, crop)
+            if to_24 and abs(src_fps - fps) > 1e-3:
+                frames = nearest_frames(frames, src_fps, fps)
+            if limit is not None:
+                frames = itertools.islice(frames, limit)
+            parts, size, buf = [], None, []
+
+            def flush():
+                nonlocal size
+                batch = torch.from_numpy(np.stack(buf))
+                if size is None:
+                    size = resize_target(int(batch.shape[2]), int(batch.shape[1]),
+                                         str(resize), resize_value)
+                parts.append(_store(batch, size))
+                buf.clear()
+
+            for img in frames:
+                buf.append(img)
+                if len(buf) == FRAME_BATCH:
+                    mm.throw_exception_if_processing_interrupted()
+                    flush()
+            if buf:
+                flush()
+            if not parts:
+                raise ValueError(f"{TAG}: no frames in the chosen window")
+            images = frames_to_image(parts)
+            n = int(images.shape[0])
+            audio = read_audio(source, w_start, n / fps)
+            how = "decoded in batches"
+        else:
+            comp = video.get_components()
+            imgs, audio = comp.images, comp.audio
+            src_fps = float(comp.frame_rate)
+            fps = float(H3_FPS) if to_24 else src_fps
+            first = int(round(start_s * src_fps))
+            idx = range(first, int(imgs.shape[0]))
+            if to_24 and abs(src_fps - fps) > 1e-3:
+                idx = [first + i for i in nearest_frames(range(len(idx)), src_fps, fps)]
+            idx = list(idx)[:limit] if limit is not None else list(idx)
+            if not idx:
+                raise ValueError(f"{TAG}: no frames in the chosen window")
+            size = resize_target(int(imgs.shape[2]), int(imgs.shape[1]), str(resize), resize_value)
+            images = imgs[idx]
+            if (int(images.shape[2]), int(images.shape[1])) != size:
+                images = _store(images.float(), size).float()
+            n = len(idx)
+            if audio is not None:
+                sr = int(audio["sample_rate"])
+                a0 = int(round(start_s * sr))
+                audio = {"waveform": audio["waveform"][..., a0:a0 + int(round(n / fps * sr))],
+                         "sample_rate": sr}
+            how = "not a plain file (components or list): decoded whole, then selected"
+        print(f"[{TAG}] video frames: {n} at {int(images.shape[2])}x{int(images.shape[1])}, "
+              f"{fps:g} fps (source {src_fps:g}), from {start_s:g} s, {how}; IMAGE "
+              f"{images.numel() * 4 / 1048576.0:.0f} MB", flush=True)
+        return (images, audio, fps, n, video)
+
 NODE_CLASS_MAPPINGS = {"H3VideoUpsampler": HTCVideoUpsampler,
-                       "H3VideoUpsamplerToFile": HTCVideoUpsamplerToFile}
+                       "H3VideoUpsamplerToFile": HTCVideoUpsamplerToFile,
+                       "H3VideoFrames": HTCVideoFrames}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3VideoUpsampler": "H3 Video Upsampler",
-                              "H3VideoUpsamplerToFile": "H3 Video Upsampler (file to file)"}
+                              "H3VideoUpsamplerToFile": "H3 Video Upsampler (file to file)",
+                              "H3VideoFrames": "H3 Video Frames (lean)"}

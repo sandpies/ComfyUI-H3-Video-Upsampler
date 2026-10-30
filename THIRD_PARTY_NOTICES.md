@@ -47,8 +47,8 @@ Read it before using the LoRA commercially.
 
 ## Ideas from ComfyUI-UtilsCollection (no code copied)
 
-The file-to-file node's streamed reading, its latent cache and its 24 fps
-re-timing follow ideas from **[silveroxides](https://github.com/silveroxides)'**
+The file-to-file and Video Frames nodes' streamed reading, the latent cache
+and the 24 fps re-timing follow ideas from **[silveroxides](https://github.com/silveroxides)'**
 [`ComfyUI-UtilsCollection`](https://github.com/silveroxides/ComfyUI-UtilsCollection)
 (AGPL-3.0), from its H3 reference-video path:
 

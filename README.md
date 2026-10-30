@@ -95,6 +95,26 @@ Two more widgets:
 A VIDEO trimmed or cropped upstream is read with core's own rules (trim
 window, rotation, even-pixel crop), still a chunk at a time.
 
+## The node: H3 Video Frames (lean)
+
+A drop-in for **Get Video Components** after Load Video: the same `images`,
+`audio` and `fps`, plus `frame_count` and the VIDEO passed through. Core
+decodes every frame to float32 into a list and then stacks it, so it briefly
+holds the clip twice. This node applies its settings while decoding, so
+skipped frames are never held, and fills the IMAGE once from 8-bit frames. On
+a 600-frame 640×360 test clip, peak RAM was **1.08×** the output, against
+**2.01×** for core-style decoding.
+
+| widget | what it does |
+|---|---|
+| `start_seconds` | skip this much first |
+| `max_frames` | stop after this many frames (0 = to the end) |
+| `frame_rate` | `source`, or `24 (H3 native)`: nearest-frame re-time on read, duration and sync kept |
+| `resize` / `resize_value` | shrink while decoding to a megapixel area or a long edge in px; never enlarges |
+
+The audio is cut to the frames kept. The IMAGE workflow uses this node now;
+for whole films, the file-to-file node avoids the IMAGE altogether.
+
 ## Guiding the re-draw
 
 The re-draw starts from sigma 0.8, which is mostly noise. With zeroed-out
