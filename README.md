@@ -30,6 +30,9 @@ Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 | `tile_tokens` | **VRAM.** Largest sequence per tile; lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
 | `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |
 | `structure_lock` | **0 = off.** Holds the re-draw's large shapes (faces, hands, line work) to the clip's at every step, so chunks and tiles stop inventing and agree where they overlap; fine detail still comes from the re-draw. Try 0.5-1, higher for animation |
+| `lock_sigma` | What `structure_lock` counts as large, in latent cells (16 px each; 2 = 32 px). 1-1.5 also holds eyes and mouths on medium shots, with a little less sharpening |
+| `fps` (optional input) | The clip's frame rate, from Get Video Components (wired in the example workflow). Unwired: 24 |
+| `off_24_audio` | Only when `fps` isn't 24: what the re-draw hears. `retime` (default) slows or speeds the soundtrack by fps/24 so it lines up with the frames; `silence`; `as_is` (out of sync, the old behaviour). The output soundtrack is always the original |
 | `conditioning` (optional input) | A CLIPTextEncode (H3 text encoder) of what the clip shows. Unwired: zeroed-out conditioning. See *Guiding the re-draw* |
 
 The recipe: 102-frame chunks sharing 17, 70000-token tiles with 128 px overlap,
@@ -69,6 +72,20 @@ texture and shading. Two controls help:
   cup") can make each tile draw them. Describe the **look** and keep objects
   general: *"2D anime, flat cel shading, clean black line art, no film grain"*,
   or *"live-action, natural skin texture, shallow depth of field"*.
+
+## Clips that aren't 24 fps
+
+H3 places every frame 1/24 s after the last and lays the soundtrack under them
+on that clock. A 60 s clip at 48 fps is 2,880 frames, which H3 reads as 120 s.
+Without `fps` wired, the real soundtrack covered only the first half, at the
+wrong speed, and the second half heard silence. The re-draw then pulled mouths
+toward the wrong syllables. Wire `fps` and the default `off_24_audio=retime`
+stretches what the re-draw hears to match.
+
+If the 48 fps file was interpolated from a 24 fps render, it's better to
+upscale the original 24 fps frames (drop every other frame) and turn on
+`frame_gen` x2 in H3 Save Video. That's half the re-draw work and keeps sync
+exact.
 
 ## The node: H3 Save Video (long-form)
 

@@ -23,6 +23,18 @@ does the rest itself:
 
 `structure_lock` holds the re-draw's large shapes to the source's at every
 step (tiled_upsampler.structure_lock_fn): 0 is the recipe as it was.
+`lock_sigma` is what counts as large, in latent cells (16 px each).
+
+H3 puts every frame 1/24 s after the last, and the soundtrack under them on
+that clock. A 48 fps clip of 60 s is 2880 frames, which H3 reads as 120 s:
+the real 60 s of audio would sit under the first half, twice too fast, and
+the second half would hear silence -- the re-draw then pulls the mouths
+toward the wrong syllables. With `fps` wired and not 24, `off_24_audio`
+decides what the re-draw hears instead (the soundtrack that comes OUT is
+always the original, untouched): `retime` slows or speeds the soundtrack by
+fps / 24 so each syllable sits under its own frame (pitch moves with it),
+`silence` conditions on silence and leaves the mouths to the frames (and to
+structure_lock), `as_is` is the old behaviour.
 
 `tile_tokens` is the one thing the chain's recipe fixes that a smaller card
 needs to move: the largest sequence one tile forward may carry. Lower means
@@ -45,6 +57,7 @@ REGEN2K_DEFAULT_LORA = "open_h3_regenerate_2k_r256pp_bf16.safetensors"
 REGEN2K_DEFAULT_STRENGTH = 0.8
 REGEN2K_SEED = 42
 REGEN2K_TEXT_DIM = 5120
+OFF_24_AUDIO = ("retime", "silence", "as_is")
 
 
 def zero_out_cond():
@@ -66,6 +79,14 @@ def text_only_cond(cond):
             d.pop(k, None)
         out.append([emb, d])
     return out
+
+
+def retime_audio(wav, sample_rate, out_rate, fps):
+    """`wav` at `sample_rate` -> `out_rate`, played fps / 24 times as long, so
+    second t of the clip lands where H3 puts frame t * fps (at t * fps / 24 s)."""
+    import comfy.audio
+    stretched = int(round(float(out_rate) * float(fps) / H3_FPS))
+    return comfy.audio.resample(wav, int(sample_rate), max(1, stretched))
 
 
 def valid_length(n):
@@ -192,6 +213,18 @@ class HTCVideoUpsampler:
                                 "tiles stop inventing and agree where they overlap; the "
                                 "re-draw still adds the fine detail. Try 0.5-1, higher for "
                                 "animation.")}),
+                "lock_sigma": ("FLOAT", {
+                    "default": _tu.LOCK_SIGMA, "min": 0.5, "max": 16.0, "step": 0.25,
+                    "tooltip": ("What structure_lock counts as 'large', in latent cells (16 px "
+                                "each; 2 = 32 px). Lower (1-1.5) also holds eyes and mouths on "
+                                "medium shots, but leaves the re-draw less to sharpen.")}),
+                "off_24_audio": (list(OFF_24_AUDIO), {
+                    "default": OFF_24_AUDIO[0],
+                    "tooltip": ("Only with fps wired and not 24: what the re-draw hears. retime = "
+                                "the soundtrack slowed/sped by fps/24 so it lines up with the "
+                                "frames H3 sees at 24 fps; silence = no sound, the mouths come "
+                                "from the frames; as_is = the old behaviour (out of sync). The "
+                                "output soundtrack is always the original.")}),
             },
             "optional": {
                 "conditioning": ("CONDITIONING", {"tooltip": (
@@ -201,6 +234,11 @@ class HTCVideoUpsampler:
                     "describe the look (\"2D anime, flat cel shading, clean line art\") "
                     "more than the objects.")}),
                 "audio": ("AUDIO", {"tooltip": "The clip's soundtrack. Passed through untouched."}),
+                "fps": ("FLOAT", {"forceInput": True, "tooltip": (
+                    "The clip's frame rate (Get Video Components fps). Unwired: taken as 24. "
+                    "H3 works on a 24 fps clock; see off_24_audio. For a 48 fps clip made by "
+                    "interpolating a 24 fps render, upscaling the 24 fps frames and using H3 "
+                    "Save Video's frame_gen x2 is faster and keeps sync exactly.")}),
                 "audio_vae": ("VAE", {"tooltip": (
                     "The H3 audio VAE. With it, the re-draw pins the real "
                     "soundtrack (best at 24 fps); without it, silence.")}),
@@ -220,7 +258,8 @@ class HTCVideoUpsampler:
 
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
-            structure_lock=0.0, audio=None, audio_vae=None, conditioning=None):
+            structure_lock=0.0, lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0],
+            audio=None, audio_vae=None, conditioning=None, fps=None):
         import comfy.nested_tensor as nt
         import comfy.samplers
         import folder_paths
@@ -251,14 +290,28 @@ class HTCVideoUpsampler:
             raise RuntimeError(f"{TAG}: {length} frames encoded to {int(video.shape[2])} "
                                f"latent steps, expected {latent_t}")
         del frames
-        if audio is not None and audio_vae is not None:
+        clip_fps = float(fps) if fps else float(H3_FPS)
+        off_24 = abs(clip_fps - H3_FPS) > 1e-3
+        mode = str(off_24_audio or OFF_24_AUDIO[0]) if off_24 else "as_is"
+        if off_24:
+            print(f"[{TAG}] WARNING: {clip_fps:g} fps clip; H3 reads every frame as 1/{H3_FPS} s, "
+                  f"so {n} frames span {n / H3_FPS:.1f} s on its clock vs {n / clip_fps:.1f} s "
+                  f"of soundtrack. off_24_audio={mode}.", flush=True)
+        if audio is not None and audio_vae is not None and mode != "silence":
             import comfy.audio
             wav = audio["waveform"]
             vsr = getattr(audio_vae, "audio_sample_rate", 44100)
-            if int(audio["sample_rate"]) != vsr:
+            if mode == "retime":
+                wav = retime_audio(wav, int(audio["sample_rate"]), vsr, clip_fps)
+            elif int(audio["sample_rate"]) != vsr:
                 wav = comfy.audio.resample(wav, int(audio["sample_rate"]), vsr)
             a_lat = fit_audio_latent(audio_vae.encode(wav[:1].movedim(1, -1)), audio_t)
-            audio_note = "conditioned on the soundtrack"
+            audio_note = "conditioned on the soundtrack" + (
+                f" retimed x{clip_fps / H3_FPS:g} ({clip_fps:g} fps)" if mode == "retime"
+                else f" out of sync ({clip_fps:g} fps)" if off_24 else "")
+        elif off_24 and mode == "silence" and audio is not None and audio_vae is not None:
+            a_lat = torch.zeros((1, 32, 2, audio_t), dtype=video.dtype)
+            audio_note = f"conditioned on silence (off_24_audio=silence, {clip_fps:g} fps)"
         else:
             a_lat = torch.zeros((1, 32, 2, audio_t), dtype=video.dtype)
             audio_note = "conditioned on silence (no audio_vae + audio)"
@@ -271,6 +324,7 @@ class HTCVideoUpsampler:
             cond = zero_out_cond()
             cond_note = "zeroed-out conditioning"
         lock = max(0.0, min(1.0, float(structure_lock or 0.0)))
+        lock_sig = max(0.5, float(lock_sigma or _tu.LOCK_SIGMA))
         model = model.clone() if hasattr(model, "clone") else model
         eff_lora = str(lora or "").strip()
         if not eff_lora or eff_lora == "None":
@@ -298,7 +352,7 @@ class HTCVideoUpsampler:
         sig_list = [round(float(s), 4) for s in r2k_sigmas]
         print(f"[{TAG}] {n} frames at {int(images.shape[2])}x{int(images.shape[1])} -> H3 "
               f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}, "
-              f"{cond_note}, structure lock {lock:g}; "
+              f"{cond_note}, structure lock {lock:g} at {lock_sig:g} cells; "
               f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag}, "
               f"sigmas {sig_list})", flush=True)
         _cd = _tu.CHAIN_DEFAULTS
@@ -316,7 +370,7 @@ class HTCVideoUpsampler:
                                budget=int(tile_tokens), steps=steps, start_sigma=0.0,
                                overlap_px=overlap_px, detail_sigma=0.0,
                                seed=int(redraw_seed), noise="per_chunk",
-                               sigmas=r2k_sigmas, structure_lock=lock)
+                               sigmas=r2k_sigmas, structure_lock=lock, lock_sigma=lock_sig)
         _tu._free(model)
         if _tu._device().type == "cuda":
             _tu._free_all_gpu()
@@ -325,7 +379,8 @@ class HTCVideoUpsampler:
         report = (f"{n} frames {int(images.shape[2])}x{int(images.shape[1])} -> "
                   f"{int(img.shape[2])}x{int(img.shape[1])}"
                   f", regen2k ({lora_tag}, {steps} steps, {cond_note}"
-                  f", structure lock {lock:g})"
+                  f", structure lock {lock:g} at {lock_sig:g} cells)"
+                  f", {audio_note}"
                   f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
         print(f"[{TAG}] {report}", flush=True)
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
