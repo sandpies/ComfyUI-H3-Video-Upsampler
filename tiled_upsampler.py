@@ -77,6 +77,11 @@ REGEN2K_SEED = 42
 REGEN2K_SIGMAS = torch.tensor([0.8, 24.0 / 35.0, 0.48, 0.0], dtype=torch.float32)
 REGEN2K_SIGMAS_RELEASE = torch.tensor([0.909375, 6.0 / 7.0, 2.0 / 3.0, 0.0], dtype=torch.float32)
 REGEN2K_SIGMAS_2STEP = torch.tensor([0.7, 0.494118, 0.0], dtype=torch.float32)
+# Structure lock: the re-draw's large shapes held to the 3D upscaler's (see
+# structure_lock_fn). 0 = off, the recipe as it was. LOCK_SIGMA is the blur in
+# latent cells (16 px each) that separates "layout" from "detail".
+STRUCTURE_LOCK = 0.0
+LOCK_SIGMA = 2.0
 
 # --- the guided re-draw (not part of the recipe) ----------------------------
 #
@@ -954,11 +959,12 @@ def _apply_low_vram_patches(model, attn_chunks=4, ffn_chunks=2):
     return model
 
 
-def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed):
+def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=None):
     """One tile through `sigmas`, audio frozen. -> the tile's video latent.
 
     `noise` is a (video, audio) pair to use as is. SamplerCustomAdvanced's
-    path, with a positive-only guider at cfg 1 and the x0 preview.
+    path, with a positive-only guider at cfg 1 and the x0 preview. `lock` is
+    a `structure_lock_fn` for this tile, or None.
     """
     import comfy.model_management as mm
     import comfy.nested_tensor as nt
@@ -976,6 +982,11 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed):
                     device=audio.device, dtype=audio.dtype)))
     guider = comfy.samplers.CFGGuider(model)
     guider.inner_set_conds({"positive": cond})
+    if lock is not None:
+        import comfy.model_patcher as mp
+        # On the guider's own options, not a model clone: the DiT stays staged.
+        guider.model_options = mp.set_model_options_post_cfg_function(
+            mp.create_model_options_clone(guider.model_options), lock)
     callback = latent_preview.prepare_callback(
         guider.model_patcher, sigmas.shape[-1] - 1, {})
     out = guider.sample(nt.NestedTensor(noise), samples, sampler, sigmas,
@@ -1003,14 +1014,20 @@ def _highpass_detail_merge(base_video, redrawn_video, sigma=8.0):
     sigma = float(sigma or 0.0)
     if sigma <= 0.0 or base_video.shape != redrawn_video.shape or base_video.dim() < 5:
         return redrawn_video
-    b, c, t, h, w = base_video.shape
     base_f = base_video.to(device=redrawn_video.device, dtype=torch.float32)
     red_f = redrawn_video.to(dtype=torch.float32)
     d = red_f - base_f
+    return (base_f + (d - _blur_hw(d, sigma))).to(dtype=redrawn_video.dtype)
+
+
+def _blur_hw(x, sigma):
+    """[B, C, T, H, W] float32, every H x W plane Gaussian-blurred at `sigma`
+    latent cells (reflect-padded, so a tile's edge is not pulled dark)."""
+    b, c, t, h, w = x.shape
     radius = max(1, int(math.ceil(3.0 * sigma)))
     rad_h = min(radius, max(0, h - 1))
     rad_w = min(radius, max(0, w - 1))
-    low = d.reshape(b * c * t, 1, h, w)
+    low = x.reshape(b * c * t, 1, h, w)
     if rad_w > 0:
         cw = torch.arange(-rad_w, rad_w + 1, device=low.device, dtype=torch.float32)
         kw = torch.exp(-0.5 * (cw / sigma) ** 2)
@@ -1021,8 +1038,46 @@ def _highpass_detail_merge(base_video, redrawn_video, sigma=8.0):
         kh = torch.exp(-0.5 * (ch / sigma) ** 2)
         kh = (kh / kh.sum()).view(1, 1, -1, 1)
         low = F.conv2d(F.pad(low, (0, 0, rad_h, rad_h), mode="reflect"), kh)
-    d_low = low.reshape(b, c, t, h, w)
-    return (base_f + (d - d_low)).to(dtype=redrawn_video.dtype)
+    return low.reshape(b, c, t, h, w)
+
+
+def structure_lock_fn(anchor, strength, sigma=LOCK_SIGMA):
+    """A sampler_post_cfg_function holding the re-draw's layout to `anchor`.
+
+    Regen2K starts from sigma 0.8: four parts noise to one part clip, so every
+    tile and every chunk is free to re-imagine a face, a hand, a line of a
+    cartoon. Each model call predicts the clean tile (x0); this moves that
+    prediction's blur at `sigma` latent cells `strength` of the way onto the
+    blur of `anchor` (the tile's 3D-upscaled source) and leaves the finer band
+    to the model. Applied at every step, the later steps sharpen the source's
+    layout rather than the one they made up -- and two chunks crossfading over
+    the same frames, or two tiles over the same pixels, are held to the same
+    source, so they agree. The last step's x0 is the output: at strength 1 it
+    is the source's blur plus the re-draw's detail above it -- the split
+    `detail_sigma` makes once, after the fact, made inside every step.
+
+    The sampler hands over the flat AV pack (video first) of the nested
+    latent; audio is left as predicted (it is frozen by the mask anyway).
+    """
+    shape = tuple(int(x) for x in anchor.shape)
+    n = math.prod(shape[1:])
+    strength = float(strength)
+    held = {}
+
+    def fn(args):
+        d = args["denoised"]
+        flat = d.reshape(d.shape[0], -1)
+        if strength <= 0.0 or flat.shape[1] < n or d.shape[0] != shape[0]:
+            return d
+        a_low = held.get(d.device)
+        if a_low is None:
+            a_low = held[d.device] = _blur_hw(anchor.to(d.device, torch.float32), sigma)
+        v = flat[:, :n].reshape(shape).float()
+        v = v + strength * (a_low - _blur_hw(v, sigma))
+        out = flat.clone()
+        out[:, :n] = v.reshape(shape[0], -1).to(out.dtype)
+        return out.reshape(d.shape)
+    return fn
 
 
 def _cond_extra_tokens(cond):
@@ -1050,7 +1105,8 @@ def _cond_extra_tokens(cond):
 
 def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
-                 detail_sigma=0.0, noise_video=None):
+                 detail_sigma=0.0, noise_video=None, structure_lock=STRUCTURE_LOCK,
+                 lock_sigma=LOCK_SIGMA):
     """Every tile stepped together, merged under the feather after each step.
 
     Step 0 hands each tile its slice of one noise field drawn at the chunk's
@@ -1058,6 +1114,8 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     > 1 is a guided re-draw: tiles on the guide's grid, guide rows budgeted.
     When `detail_sigma > 0`, applies `_highpass_detail_merge(video, x, detail_sigma)`
     so low-frequency tile-grid shifts are stripped while fine detail is kept.
+    `structure_lock` > 0 holds every tile's large shapes to its slice of
+    `video` (the upscaled source) at every step; see `structure_lock_fn`.
     Includes an automatic OOM guardrail: if a tile forward runs out of VRAM at
     `budget`, halves the tile token budget to split into smaller tiles and
     retries the chunk automatically.
@@ -1085,6 +1143,10 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                              cond_for_tile(cond, h, w, r0, c0, rows, cols),
                              feather(rows, cols, st, sl, top, left, bottom, right,
                                      dev)[None, None, None]))
+        locks = [structure_lock_fn(video[:, :, :, r0:r0 + rows, c0:c0 + cols],
+                                   structure_lock, lock_sigma)
+                 if float(structure_lock) > 0.0 else None
+                 for (r0, c0, rows, cols, *_rest) in prepared]
         tokens = (seq_len(grid[2], grid[3], t) if int(factor) <= 1
                   else f"{guided_seq_len(grid[2], grid[3], t, factor)} (guide incl.)")
         _sig_s = [round(float(s), 4) for s in sigmas]
@@ -1092,7 +1154,9 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
               f"{grid[0]}x{grid[1]} tiles of {grid[2]}x{grid[3]}px, overlap "
               f"{grid[4]}/{grid[5]}px, {tokens} tokens per "
               f"forward, stepped together, sigmas {_sig_s}"
-              + (f", high-pass detail={float(detail_sigma):g}" if float(detail_sigma or 0.0) > 0.0 else ""),
+              + (f", high-pass detail={float(detail_sigma):g}" if float(detail_sigma or 0.0) > 0.0 else "")
+              + (f", structure lock {float(structure_lock):g} at {float(lock_sigma):g} cells"
+                 if float(structure_lock) > 0.0 else ""),
               flush=True)
 
         # Multi-step (0.2.0): every step runs over ALL tiles and is merged under
@@ -1112,7 +1176,8 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                 r0, c0, rows, cols, tcond, _m = prepared[0]
                 xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
                 noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
-                ot = sample_tile(model, tcond, sampler, sigmas, xt, audio, noise, seed)
+                ot = sample_tile(model, tcond, sampler, sigmas, xt, audio, noise, seed,
+                                 lock=locks[0])
                 _calls += 1
                 x = ot.to(device=dev, dtype=dt)
                 del ot, xt
@@ -1124,13 +1189,14 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                 for step in range(len(sigmas) - 1):
                     two = sigmas[step:step + 2]
                     acc = torch.zeros_like(x, dtype=torch.float32)
-                    for r0, c0, rows, cols, tcond, m in prepared:
+                    for (r0, c0, rows, cols, tcond, m), lock in zip(prepared, locks):
                         xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
                         if step == 0:
                             noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
                         else:
                             noise = (torch.zeros_like(xt), torch.zeros_like(audio))
-                        ot = sample_tile(model, tcond, sampler, two, xt, audio, noise, seed)
+                        ot = sample_tile(model, tcond, sampler, two, xt, audio, noise, seed,
+                                         lock=lock)
                         _calls += 1
                         acc[:, :, :, r0:r0 + rows, c0:c0 + cols] += \
                             ot.to(device=dev, dtype=torch.float32) * m
@@ -1276,7 +1342,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              start_sigma=0.0, overlap_px=TILE_OVERLAP_PX, detail_sigma=0.0,
              chunk_frames=_DEFAULT_CHUNK_FRAMES, chunk_overlap=CHUNK_OVERLAP,
              anchor=ANCHOR_AUG, seed=SEED, noise="per_chunk",
-             attn_chunks=4, ffn_chunks=2, sigmas=None):
+             attn_chunks=4, ffn_chunks=2, sigmas=None,
+             structure_lock=STRUCTURE_LOCK, lock_sigma=LOCK_SIGMA):
     """The whole recipe on an H3 AV latent. -> the upsampled AV latent dict.
 
     `conditioning` is one conditioning for the whole clip, or a callable
@@ -1290,6 +1357,9 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     `budget` caps one tile forward's tokens (default: the recipe's). Lower it
     and the same frame is cut into more, smaller tiles -- less VRAM, more
     forwards, the same feathered merge.
+
+    `structure_lock` (0..1) holds each chunk's re-draw to the large shapes of
+    its own 3D-upscaled frames (`structure_lock_fn`); 0 is the recipe as is.
     """
     import comfy.nested_tensor as nt
 
@@ -1420,7 +1490,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         _rc = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, int(seed), factor,
                            cur_budget, overlap_px, detail_sigma=detail_sigma,
                            noise_video=(None if film_nv is None
-                                        else film_nv[:, :, k0:k1]))
+                                        else film_nv[:, :, k0:k1]),
+                           structure_lock=structure_lock, lock_sigma=lock_sigma)
         rv, cur_budget = (_rc if isinstance(_rc, tuple) else (_rc, cur_budget))
         _redraw_s += time.perf_counter() - _tr
         _oom_total += _LAST_OOM[0]
@@ -1616,6 +1687,7 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             chunk_frames=st["chunk_frames"], chunk_overlap=st["chunk_overlap"],
             anchor=st["anchor_strength"], seed=st["seed"], noise=st["noise"],
             attn_chunks=st["attn_chunks"], ffn_chunks=st["ffn_chunks"],
+            structure_lock=st["structure_lock"], lock_sigma=st["lock_sigma"],
         )
         if sigmas is not None:
             _ukw["sigmas"] = sigmas
@@ -1745,6 +1817,7 @@ CHAIN_DEFAULTS = {
     "chunk_frames": _DEFAULT_CHUNK_FRAMES, "chunk_overlap": CHUNK_OVERLAP,
     "anchor_strength": ANCHOR_AUG, "tile_overlap_px": TILE_OVERLAP_PX, "detail_sigma": 0.0,
     "attn_chunks": 4, "ffn_chunks": 2, "sampler": None,
+    "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
 }
 
 
@@ -1824,6 +1897,17 @@ class HTCUpsampleSettings:
                     "tooltip": "Feed-forward split into this many token groups to save "
                                "VRAM. Keep 2 or raise it on smaller cards; 1 needs far "
                                "more VRAM. Same result either way."}),
+                "structure_lock": ("FLOAT", {
+                    "default": d["structure_lock"], "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "0 = off. Holds the re-draw's large shapes (faces, hands, "
+                               "line work) to the source at every step, so chunks and "
+                               "tiles stop inventing and agree where they overlap; the "
+                               "re-draw still adds the fine detail. Try 0.5-1."}),
+                "lock_sigma": ("FLOAT", {
+                    "default": d["lock_sigma"], "min": 0.5, "max": 16.0, "step": 0.25,
+                    "tooltip": "What structure_lock counts as 'large', in latent cells "
+                               "(16 px each). Lower holds finer features (eyes, mouth "
+                               "shape) but leaves the re-draw less to sharpen."}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {

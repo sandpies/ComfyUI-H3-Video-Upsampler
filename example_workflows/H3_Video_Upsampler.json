@@ -24,7 +24,7 @@
     "Node name for S&R": "MarkdownNote"
    },
    "widgets_values": [
-    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip (put it in `ComfyUI/input`). Any size; 24 fps is what H3\n   assumes, other rates work but the soundtrack conditions the re-draw loosely.\n2. **Queue.** H3 Save Video writes it to `video/H3_upsampled` at the clip's own fps,\n   with its own soundtrack untouched (NVENC when there is a GPU). Set its `frame_gen` to x2 for\n   double the frame rate (RTX GPU + `nvidia-vfx`).\n\n### The node\n- **megapixels**: output size, aspect kept (2 = about 1920x1080).\n- **denoise**: Regen2K LoRA strength for the 3-step Euler re-draw on `[0.8, 24/35, 0.48, 0]` (0.8 is the default; 0 skips the re-draw and only enlarges).\n- **lora**: the Open-H3-Regenerate-2K LoRA (`open_h3_regenerate_2k_r256pp_bf16.safetensors` by default).\n- **tile_tokens**: VRAM. Lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on a smaller card.\n- **redraw_seed**: noise seed for the Regen2K re-draw (42 by default).\n- **audio_vae** wired = the re-draw pins the real soundtrack; unwired = it pins silence.\n\nMouths and motion come from the clip; only fine detail is re-drawn."
+    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip (put it in `ComfyUI/input`). Any size; 24 fps is what H3\n   assumes, other rates work but the soundtrack conditions the re-draw loosely.\n2. **Queue.** H3 Save Video writes it to `video/H3_upsampled` at the clip's own fps,\n   with its own soundtrack untouched (NVENC when there is a GPU). Set its `frame_gen` to x2 for\n   double the frame rate (RTX GPU + `nvidia-vfx`).\n\n### The node\n- **megapixels**: output size, aspect kept (2 = about 1920x1080).\n- **denoise**: Regen2K LoRA strength for the 3-step Euler re-draw on `[0.8, 24/35, 0.48, 0]` (0.8 is the default; 0 skips the re-draw and only enlarges).\n- **lora**: the Open-H3-Regenerate-2K LoRA (`open_h3_regenerate_2k_r256pp_bf16.safetensors` by default).\n- **tile_tokens**: VRAM. Lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on a smaller card.\n- **redraw_seed**: noise seed for the Regen2K re-draw (42 by default).\n- **structure_lock**: 0 = off. Holds the re-draw to the clip's large shapes (faces, hands, line work) at every step so chunks and tiles stop inventing; try 0.5-1, higher for animation.\n- **conditioning** (optional): a CLIPTextEncode of what the clip shows, typed or written by a VLM. Unwired = zeroed-out conditioning.\n- **audio_vae** wired = the re-draw pins the real soundtrack; unwired = it pins silence.\n\nMouths and motion come from the clip; only fine detail is re-drawn."
    ]
   },
   {
@@ -302,7 +302,8 @@
     "open_h3_regenerate_2k_r256pp_bf16.safetensors",
     70000,
     "euler",
-    42
+    42,
+    0.0
    ]
   },
   {

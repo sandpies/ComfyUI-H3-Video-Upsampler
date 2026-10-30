@@ -29,6 +29,8 @@ Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 | `lora` | Open-H3-Regenerate-2K LoRA from `models/loras` (`open_h3_regenerate_2k_r256pp_bf16.safetensors` by default) |
 | `tile_tokens` | **VRAM.** Largest sequence per tile; lower = shorter chunks (down to 68 f) before splitting into spatial tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
 | `redraw_seed` | Noise seed for the Regen2K re-draw (42 by default) |
+| `structure_lock` | **0 = off.** Holds the re-draw's large shapes (faces, hands, line work) to the clip's at every step, so chunks and tiles stop inventing and agree where they overlap; fine detail still comes from the re-draw. Try 0.5-1, higher for animation |
+| `conditioning` (optional input) | A CLIPTextEncode (H3 text encoder) of what the clip shows. Unwired: zeroed-out conditioning. See *Guiding the re-draw* |
 
 The recipe: 102-frame chunks sharing 17, 70000-token tiles with 128 px overlap,
 fresh noise per chunk, the soundtrack pinned clean.
@@ -45,6 +47,28 @@ fresh noise per chunk, the soundtrack pinned clean.
   in slices so a long clip never sits in RAM as one tensor.
 - Any frame size and length: frames are fitted to 32 px and padded to a valid H3
   length, then the padding is trimmed off again.
+
+## Guiding the re-draw
+
+The re-draw starts from sigma 0.8, which is mostly noise. With zeroed-out
+conditioning it only has the 3D-upscaled frames to go on. Realistic footage
+mostly holds up, but faces drift slightly, and animation gets extra lines,
+texture and shading. Two controls help:
+
+- **`structure_lock`** keeps the layout from the source. Each step's
+  clean-frame prediction is pulled toward the upscaled clip at scales above
+  about 32 px. The re-draw can still sharpen but can't move or reshape things.
+  It acts on every tile and chunk, so two chunks crossfading over the same 17
+  frames also stop disagreeing. Start at 0.5. For animation try 0.75-1, and
+  lower its blur by setting HTC Upsample Settings' `lock_sigma` below 2 when
+  small features such as eyes still drift.
+- **`conditioning`** says what the clip is. Wire `CLIPTextEncode` with the H3
+  text encoder and either type a caption or feed it a VLM's (Qwen-VL, Florence,
+  etc.) description of a few frames. Every spatial tile hears the whole prompt,
+  so when a chunk splits into tiles a prompt naming objects ("a woman holding a
+  cup") can make each tile draw them. Describe the **look** and keep objects
+  general: *"2D anime, flat cel shading, clean black line art, no film grain"*,
+  or *"live-action, natural skin texture, shallow depth of field"*.
 
 ## The node: H3 Save Video (long-form)
 

@@ -12,11 +12,17 @@ does the rest itself:
 2. encodes them with the video VAE, and the soundtrack with the audio VAE when
    both are wired (otherwise a silent stream: the audio is frozen in the
    re-draw either way, it only conditions it);
-3. builds zeroed-out conditioning (no prompt, no references);
+3. builds zeroed-out conditioning (no prompt, no references), or takes the
+   `conditioning` wired in -- a text encode of what the clip shows, typed or
+   written by a VLM -- with its references and keyframes stripped, as the
+   chain's regen2k_cond=hop_text does;
 4. runs the same Open-H3-Regenerate-2K upsampler the chain does -- 3D latent
    upscale per chunk, then 3 Euler steps in tiles (noise="per_chunk", seed 42);
 5. decodes, trims the padding off, and hands back the frames with the
    original soundtrack untouched.
+
+`structure_lock` holds the re-draw's large shapes to the source's at every
+step (tiled_upsampler.structure_lock_fn): 0 is the recipe as it was.
 
 `tile_tokens` is the one thing the chain's recipe fixes that a smaller card
 needs to move: the largest sequence one tile forward may carry. Lower means
@@ -47,6 +53,19 @@ def zero_out_cond():
     return [[torch.zeros((1, 1, REGEN2K_TEXT_DIM), dtype=torch.float32),
              {"pooled_output": None,
               "minimax_token_tags": torch.ones(1, dtype=torch.long)}]]
+
+
+def text_only_cond(cond):
+    """A wired conditioning with only its text kept: references, keyframes and
+    their noise-aug settings dropped (the chain's regen2k_cond=hop_text)."""
+    out = []
+    for emb, d in cond:
+        d = dict(d)
+        for k in ("minimax_refs", "minimax_keyframes",
+                  "minimax_visual_cond_noise_aug", "minimax_audio_cond_noise_aug"):
+            d.pop(k, None)
+        out.append([emb, d])
+    return out
 
 
 def valid_length(n):
@@ -166,8 +185,21 @@ class HTCVideoUpsampler:
                 "redraw_seed": ("INT", {
                     "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
                     "tooltip": "Noise seed for the Regen2K re-draw (default: 42)."}),
+                "structure_lock": ("FLOAT", {
+                    "default": _tu.STRUCTURE_LOCK, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": ("0 = off. Holds the re-draw's large shapes (faces, hands, "
+                                "line work) to the source clip at every step, so chunks and "
+                                "tiles stop inventing and agree where they overlap; the "
+                                "re-draw still adds the fine detail. Try 0.5-1, higher for "
+                                "animation.")}),
             },
             "optional": {
+                "conditioning": ("CONDITIONING", {"tooltip": (
+                    "What the clip shows, from the H3 text encoder (CLIPTextEncode), typed "
+                    "or written by a VLM. Unwired: zeroed-out conditioning. References and "
+                    "keyframes in it are dropped. Every tile hears the whole prompt, so "
+                    "describe the look (\"2D anime, flat cel shading, clean line art\") "
+                    "more than the objects.")}),
                 "audio": ("AUDIO", {"tooltip": "The clip's soundtrack. Passed through untouched."}),
                 "audio_vae": ("VAE", {"tooltip": (
                     "The H3 audio VAE. With it, the re-draw pins the real "
@@ -181,13 +213,14 @@ class HTCVideoUpsampler:
     CATEGORY = "video/upscale"
     DESCRIPTION = (
         "Upsamples a finished clip with Open-H3-Regenerate-2K: H3 3D latent upscale, then "
-        "3 Euler steps on [0.8, 24/35, 0.48, 0] with zeroed-out conditioning and the "
-        "soundtrack pinned clean (noise=per_chunk, seed 42). tile_tokens lets a smaller card "
-        "shorten chunks or cut more tiles.")
+        "3 Euler steps on [0.8, 24/35, 0.48, 0] with zeroed-out conditioning (or the wired "
+        "conditioning's text) and the soundtrack pinned clean (noise=per_chunk, seed 42). "
+        "structure_lock holds the re-draw to the source's large shapes; tile_tokens lets a "
+        "smaller card shorten chunks or cut more tiles.")
 
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
-            audio=None, audio_vae=None):
+            structure_lock=0.0, audio=None, audio_vae=None, conditioning=None):
         import comfy.nested_tensor as nt
         import comfy.samplers
         import folder_paths
@@ -231,7 +264,13 @@ class HTCVideoUpsampler:
             audio_note = "conditioned on silence (no audio_vae + audio)"
         latent = {"samples": nt.NestedTensor((video, a_lat.to(video.device, video.dtype)))}
 
-        cond = zero_out_cond()
+        if conditioning:
+            cond = text_only_cond(conditioning)
+            cond_note = "wired conditioning (text only)"
+        else:
+            cond = zero_out_cond()
+            cond_note = "zeroed-out conditioning"
+        lock = max(0.0, min(1.0, float(structure_lock or 0.0)))
         model = model.clone() if hasattr(model, "clone") else model
         eff_lora = str(lora or "").strip()
         if not eff_lora or eff_lora == "None":
@@ -258,7 +297,8 @@ class HTCVideoUpsampler:
         sampler = comfy.samplers.sampler_object(str(sampler_name))
         sig_list = [round(float(s), 4) for s in r2k_sigmas]
         print(f"[{TAG}] {n} frames at {int(images.shape[2])}x{int(images.shape[1])} -> H3 "
-              f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}; "
+              f"canvas {w}x{h}, {length} frames ({latent_t} latent steps), {audio_note}, "
+              f"{cond_note}, structure lock {lock:g}; "
               f"tile budget {int(tile_tokens)} tokens; regen2k ({lora_tag}, "
               f"sigmas {sig_list})", flush=True)
         _cd = _tu.CHAIN_DEFAULTS
@@ -276,7 +316,7 @@ class HTCVideoUpsampler:
                                budget=int(tile_tokens), steps=steps, start_sigma=0.0,
                                overlap_px=overlap_px, detail_sigma=0.0,
                                seed=int(redraw_seed), noise="per_chunk",
-                               sigmas=r2k_sigmas)
+                               sigmas=r2k_sigmas, structure_lock=lock)
         _tu._free(model)
         if _tu._device().type == "cuda":
             _tu._free_all_gpu()
@@ -284,7 +324,8 @@ class HTCVideoUpsampler:
         del out
         report = (f"{n} frames {int(images.shape[2])}x{int(images.shape[1])} -> "
                   f"{int(img.shape[2])}x{int(img.shape[1])}"
-                  f", regen2k ({lora_tag}, {steps} steps)"
+                  f", regen2k ({lora_tag}, {steps} steps, {cond_note}"
+                  f", structure lock {lock:g})"
                   f", tile budget {int(tile_tokens)}, overlap {overlap_px}px")
         print(f"[{TAG}] {report}", flush=True)
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
