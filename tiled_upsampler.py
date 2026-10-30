@@ -1918,8 +1918,11 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
           + (f", h3upscale guide at {w_px // factor}x{h_px // factor}"
              if guide is not None and sigmas is not None else "")
           + f", tile_tokens {budget_note}, attention {attn_note}, chunk_join {chunk_join}, chunking "
-          f"{'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}, lock anchor "
-          f"{lock_anchor}, tile context {tile_context}", flush=True)
+          f"{'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}"
+          + (f", structure lock {float(structure_lock):g} ({lock_anchor})"
+             if float(structure_lock) > 0.0 else "")
+          + (f", tile context {tile_context}" if str(tile_context) != "none" else ""),
+          flush=True)
 
     # 3-Phase non-overlapping execution so VideoVAE, 3D LatentUpscaler, and the
     # 32.4 GB DynamicVRAM H3 DiT never coexist or churn in and out of VRAM
@@ -2408,9 +2411,9 @@ class HTCTiledUpsampler:
 # recipe's single step from 0.75 kept 14% more fine detail.
 
 SETTINGS_TYPE = "HTC_UPSAMPLE"
-ATTENTION_TIP = ("dense = normal. sparse = ComfyUI's sparse attention: much faster on long "
-                 "clips, but approximate, so compare faces before relying on it. Falls back to "
-                 "dense on a ComfyUI without it.")
+ATTENTION_TIP = ("sparse (default) = ComfyUI's sparse attention: in side-by-side tests a "
+                 "whole run was 28% faster and looked the same. dense = exact attention, "
+                 "slower. A ComfyUI without sparse attention runs dense.")
 JOIN_TIP = ("How the overlapping pieces of a long clip are joined. stepped (recommended) = all "
             "pieces are re-drawn together and agree at every step, so faces don't change at a "
             "join. crossfade = each piece is re-drawn on its own and the overlaps are blended "
@@ -2432,7 +2435,7 @@ CHAIN_DEFAULTS = {
     "anchor_strength": ANCHOR_AUG, "tile_overlap_px": TILE_OVERLAP_PX, "detail_sigma": 0.0,
     "attn_chunks": 4, "ffn_chunks": 2, "sampler": None,
     "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
-    "attention": "dense", "chunk_join": "stepped", "chunking": True, "tiling": True,
+    "attention": "sparse", "chunk_join": "stepped", "chunking": True, "tiling": True,
     "lock_anchor": "source", "tile_context": "none", "redraw_start": 0.6,
 }
 

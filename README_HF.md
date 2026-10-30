@@ -32,6 +32,11 @@ detail -- the same upsampler Hand-Tie-Clips runs over a whole chain. Mouths, mot
 Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 `minimax_h3_fl2va_pruned_int8_convrot` DiT, video and audio VAE).
 
+**Faster VAE (optional):** `minimax_h3_sol_vae_fp16.safetensors` in the VAE loader made a
+whole run about 20% faster in tests. Colour and motion were identical; hair edges came out
+about 5% softer by measurement. It needs a ComfyUI from late October 2026, which loads its
+decoder. The standard `minimax_h3_video_vae_int8_convrot` stays the default.
+
 On a ComfyUI from 28 October 2026 on, the 3D upscale runs through core's own
 H3 latent upscaler (Kijai): the whole clip in one pass with clip-wide statistics, so
 every chunk starts the re-draw from one consistently toned film, and faster. Older
@@ -47,7 +52,7 @@ ComfyUI uses the bundled copy, chunk by chunk, with the same checkpoint.
 | `tile_tokens` | How much work goes to the GPU at once. **0 = automatic (recommended):** it learns what your card can take and remembers it for the next run (in `ComfyUI/user/htc_upsampler_memory.json`). A number fixes it: lower uses less VRAM by cutting the clip into shorter pieces (never under 68 frames) and then tiles |
 | `sampler_name` | Keep `euler`: Regen2K is tuned for it |
 | `redraw_seed` | Noise seed for the re-draw (42). Same seed, same result |
-| `attention` | `dense` (default) or `sparse`: ComfyUI's sparse attention, much faster on long clips but approximate, so compare faces. Runs dense on a ComfyUI without it |
+| `attention` | **`sparse` (default):** ComfyUI's sparse attention. In side-by-side tests a whole run was 28% faster and looked the same (3% softer on fine edges by measurement). `dense`: exact attention, slower. A ComfyUI without sparse attention runs dense |
 | `chunk_join` | How the overlapping pieces of a long clip are joined. **`stepped` (default):** all pieces, and all tiles when a frame has to be tiled, are re-drawn together and merged after every step, so faces don't change at a join and VRAM stays at one piece's worth. `crossfade`: each piece on its own, overlaps blended (the old way; a face can shift at a join) |
 | `chunking` / `tiling` | On (default) = the work may be split when it's too much for the GPU; neither forces a split. Chunking cuts the clip into overlapping pieces of about 4 s; tiling also cuts frames into tiles, only when even a short piece doesn't fit. **Both off = the whole clip in one pass**, for short clips on big cards. With tiling off, running out of VRAM stops with a message saying what to change |
 | `redraw_start` | How much the re-draw may change. **0.6 (default)** keeps faces close to your clip. 0.8 = the original Regen2K recipe: sharper, but faces drift more. Lower than 0.6 changes less again. The rest of the schedule follows automatically (0.6 → 0.48 → 0.3 → 0 at 3 steps) |

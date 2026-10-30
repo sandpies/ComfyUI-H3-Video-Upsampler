@@ -24,7 +24,7 @@
     "Node name for S&R": "MarkdownNote"
    },
    "widgets_values": [
-    "## H3 Video Upsampler (file to file)\n\nSame result as the IMAGE workflow, for clips of any length on any machine: the video is read, upscaled and saved **a piece at a time**, so RAM stays low however long it is.\n\n1. **Load Video**: pick the clip. Frame rate and sound come from the file.\n2. **Queue.** The MP4 lands in `video/H3_upsampled` with the original soundtrack.\n\n### Settings worth knowing\n- **megapixels / denoise / redraw_start / redraw_steps / tile_tokens / chunk_join**: as in the IMAGE workflow.\n- **frame_rate**: `24 (H3 native)` converts to 24 fps while reading: exact lip sync and half the work for 48 fps clips. Add `frame_gen` x2 to get 48 fps back.\n- **frame_gen / codec / quality**: how the MP4 is saved. x2 doubles the frame rate (RTX + `nvidia-vfx`).\n- **reuse_encoded**: re-running the same clip with other settings starts faster.\n- **conditioning** (optional): a text prompt describing the look.\n"
+    "## H3 Video Upsampler (file to file)\n\nSame result as the IMAGE workflow, for clips of any length on any machine: the video is read, upscaled and saved **a piece at a time**, so RAM stays low however long it is.\n\n1. **Load Video**: pick the clip. Frame rate and sound come from the file.\n2. **Queue.** The MP4 lands in `video/H3_upsampled` with the original soundtrack.\n\n### Settings worth knowing\n- **megapixels / denoise / redraw_start / redraw_steps / tile_tokens / chunk_join / attention**: as in the IMAGE workflow.\n- **frame_rate**: `24 (H3 native)` converts to 24 fps while reading: exact lip sync and half the work for 48 fps clips. Add `frame_gen` x2 to get 48 fps back.\n- **frame_gen / codec / quality**: how the MP4 is saved. x2 doubles the frame rate (RTX + `nvidia-vfx`).\n- **reuse_encoded**: re-running the same clip with other settings starts faster.\n- **conditioning** (optional): a text prompt describing the look.\n\n**Faster VAE (optional):** in the VAE loader, `minimax_h3_sol_vae_fp16.safetensors` made a whole run about 20% faster in tests and looked the same apart from slightly softer hair edges. It needs a ComfyUI from late October 2026.\n"
    ]
   },
   {
@@ -237,7 +237,7 @@
     0,
     "euler",
     42,
-    "dense",
+    "sparse",
     "stepped",
     true,
     true,

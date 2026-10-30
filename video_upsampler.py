@@ -467,7 +467,9 @@ class HTCVideoUpsampler:
             "required": {
                 "model": ("MODEL", {"tooltip": (
                     "The H3 model (UNETLoader: minimax_h3_fl2va_pruned_int8_convrot).")}),
-                "vae": ("VAE", {"tooltip": "The H3 video VAE."}),
+                "vae": ("VAE", {"tooltip": (
+                    "The H3 video VAE. Tip: the sol-VAE (minimax_h3_sol_vae_fp16) made a "
+                    "whole run about 20% faster in tests, with hair edges a touch softer.")}),
                 "images": ("IMAGE", {"tooltip": (
                     "The clip's frames. Any size: it's fitted to a multiple of 32 px.")}),
                 "upscale_model": (_tu.choices(), {
@@ -498,7 +500,7 @@ class HTCVideoUpsampler:
                     "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
                     "tooltip": "Noise seed for the re-draw. Same seed, same result."}),
                 "attention": (list(_tu.ATTENTION_MODES), {
-                    "default": "dense", "tooltip": _tu.ATTENTION_TIP}),
+                    "default": "sparse", "tooltip": _tu.ATTENTION_TIP}),
                 "chunk_join": (list(_tu.JOIN_MODES), {
                     "default": "stepped", "tooltip": _tu.JOIN_TIP}),
                 "chunking": ("BOOLEAN", {"default": True, "tooltip": _tu.CHUNKING_TIP}),
@@ -545,7 +547,7 @@ class HTCVideoUpsampler:
 
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
-            attention="dense", chunk_join="stepped", chunking=True, tiling=True,
+            attention="sparse", chunk_join="stepped", chunking=True, tiling=True,
             redraw_start=0.6, redraw_steps=REDRAW_STEPS[0], audio=None,
             audio_vae=None, conditioning=None, fps=None):
         check_vae(vae)
@@ -574,16 +576,15 @@ def check_vae(vae):
     if (_fsm is not None and type(_fsm).__name__ == "MiniMaxH3VideoVAE"
             and not hasattr(_fsm, "decoder")):
         raise RuntimeError(
-            f"{TAG}: the wired Video VAE has no decoder (encoder-only, 343 MB — "
-            "e.g. minimax_h3_sol_vae_fp16.safetensors uses decoder.blocks.* keys "
-            "which ComfyUI's stock VAELoader skips). Pick "
-            "minimax_h3_lynnreal_light_vae_int8_convrot.safetensors or "
-            "minimax_h3_video_vae_int8_convrot.safetensors in VAELoader.")
+            f"{TAG}: the wired Video VAE loaded without its decoder. The sol-VAE "
+            "(minimax_h3_sol_vae_fp16.safetensors) needs a ComfyUI from late October 2026; "
+            "update ComfyUI, or pick minimax_h3_video_vae_int8_convrot.safetensors in "
+            "VAELoader.")
 
 
 def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
            tile_tokens, sampler_name, redraw_seed, audio, audio_vae, conditioning, fps,
-           attention="dense", chunk_join="stepped", chunking=True, tiling=True,
+           attention="sparse", chunk_join="stepped", chunking=True, tiling=True,
            redraw_start=0.6, redraw_steps=REDRAW_STEPS[0]):
     """Steps 2-4 for a clip already encoded: `video` is the H3 video latent of
     `n` frames padded to `valid_length(n)`. -> (upsampled video latent, report)."""
@@ -744,7 +745,7 @@ class HTCVideoUpsamplerToFile:
         "rate and sound come from the file.")
 
     def run(self, video, model, vae, upscale_model, megapixels, denoise, lora, tile_tokens,
-            sampler_name, redraw_seed=REGEN2K_SEED, attention="dense",
+            sampler_name, redraw_seed=REGEN2K_SEED, attention="sparse",
             chunk_join="stepped", chunking=True, tiling=True, redraw_start=0.6,
             redraw_steps=REDRAW_STEPS[0], frame_gen="off",
             codec="auto", quality="max", filename_prefix="video/H3_upsampled",

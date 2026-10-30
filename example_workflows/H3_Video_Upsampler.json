@@ -24,7 +24,7 @@
     "Node name for S&R": "MarkdownNote"
    },
    "widgets_values": [
-    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip. **Video Frames** picks the part to upscale (`start_seconds`, `duration_seconds`) and can convert to 24 fps.\n2. **Queue.** H3 Save Video writes the result to `video/H3_upsampled` with the original soundtrack. Set its `frame_gen` to x2 for double the frame rate (RTX card + `nvidia-vfx`).\n\n### Settings worth knowing\n- **megapixels**: output size (2 = about 1920x1080).\n- **denoise**: how strongly detail is re-drawn. 0.8 = normal, 0 = only enlarge.\n- **redraw_start**: how much the re-draw may change. **0.6** (default) keeps faces close to your clip; 0.8 = the original recipe, sharper but faces drift more.\n- **redraw_steps**: 3 = the recipe; 2 = a third faster and looked the same in tests.\n- **tile_tokens**: leave at 0 (automatic: it learns what your GPU can take).\n- **chunk_join**: leave on `stepped`: long clips are cut into overlapping pieces that are re-drawn together, so there are no seams at the joins.\n- **chunking / tiling**: leave on. They only split the work when your GPU needs it. Both off = one pass, for short clips on big cards.\n- **attention**: `sparse` is faster on long clips but approximate; compare faces.\n- **fps** and **audio_vae** wired = lip sync is kept, also for 48 fps clips.\n- **conditioning** (optional): a text prompt describing the look. Unwired works well for most clips.\n\nFor long clips, use the file-to-file workflow: it keeps RAM low whatever the length.\n"
+    "## H3 Video Upsampler: upscale a finished clip\n\n1. **Load Video**: pick the clip. **Video Frames** picks the part to upscale (`start_seconds`, `duration_seconds`) and can convert to 24 fps.\n2. **Queue.** H3 Save Video writes the result to `video/H3_upsampled` with the original soundtrack. Set its `frame_gen` to x2 for double the frame rate (RTX card + `nvidia-vfx`).\n\n### Settings worth knowing\n- **megapixels**: output size (2 = about 1920x1080).\n- **denoise**: how strongly detail is re-drawn. 0.8 = normal, 0 = only enlarge.\n- **redraw_start**: how much the re-draw may change. **0.6** (default) keeps faces close to your clip; 0.8 = the original recipe, sharper but faces drift more.\n- **redraw_steps**: 3 = the recipe; 2 = a third faster and looked the same in tests.\n- **tile_tokens**: leave at 0 (automatic: it learns what your GPU can take).\n- **chunk_join**: leave on `stepped`: long clips are cut into overlapping pieces that are re-drawn together, so there are no seams at the joins.\n- **chunking / tiling**: leave on. They only split the work when your GPU needs it. Both off = one pass, for short clips on big cards.\n- **attention**: `sparse` (default) is about 28% faster and looked the same in tests; `dense` is exact but slower.\n- **fps** and **audio_vae** wired = lip sync is kept, also for 48 fps clips.\n- **conditioning** (optional): a text prompt describing the look. Unwired works well for most clips.\n\nFor long clips, use the file-to-file workflow: it keeps RAM low whatever the length.\n\n**Faster VAE (optional):** in the VAE loader, `minimax_h3_sol_vae_fp16.safetensors` made a whole run about 20% faster in tests and looked the same apart from slightly softer hair edges. It needs a ComfyUI from late October 2026.\n"
    ]
   },
   {
@@ -318,7 +318,7 @@
     0,
     "euler",
     42,
-    "dense",
+    "sparse",
     "stepped",
     true,
     true,
