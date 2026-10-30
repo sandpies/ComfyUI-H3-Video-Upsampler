@@ -2423,8 +2423,8 @@ CHAIN_DEFAULTS = {
     "anchor_strength": ANCHOR_AUG, "tile_overlap_px": TILE_OVERLAP_PX, "detail_sigma": 0.0,
     "attn_chunks": 4, "ffn_chunks": 2, "sampler": None,
     "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
-    "attention": "dense", "chunk_join": "crossfade", "chunking": True, "tiling": True,
-    "lock_anchor": "source", "tile_context": "none", "redraw_start": 0.8,
+    "attention": "dense", "chunk_join": "stepped", "chunking": True, "tiling": True,
+    "lock_anchor": "source", "tile_context": "none", "redraw_start": 0.6,
 }
 
 
@@ -2450,8 +2450,8 @@ class HTCUpsampleSettings:
             "required": {
                 "steps": ("INT", {
                     "default": 3, "min": 1, "max": 8,
-                    "tooltip": "Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster and "
-                               "sharpens less (at the default start: [0.7, 0.494, 0])."}),
+                    "tooltip": "Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster, "
+                               "and in side-by-side tests looked the same."}),
                 "start_sigma": ("FLOAT", {
                     "default": d["start_sigma"], "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": "Leave at 0 (= Regen2K; use redraw_start instead). Above 0 the "
@@ -2499,7 +2499,7 @@ class HTCUpsampleSettings:
                     "default": d["attention"],
                     "tooltip": ATTENTION_TIP}),
                 "chunk_join": (list(JOIN_MODES), {
-                    "default": "stepped",
+                    "default": d["chunk_join"],
                     "tooltip": JOIN_TIP}),
                 "chunking": ("BOOLEAN", {
                     "default": d["chunking"], "tooltip": CHUNKING_TIP}),
@@ -2507,9 +2507,9 @@ class HTCUpsampleSettings:
                     "default": d["tiling"], "tooltip": TILING_TIP}),
                 "redraw_start": ("FLOAT", {
                     "default": d["redraw_start"], "min": 0.3, "max": 0.95, "step": 0.05,
-                    "tooltip": "How much the re-draw is allowed to change. 0.8 = the Regen2K "
-                               "recipe. Lower stays closer to the chain's frames: faces drift "
-                               "less, but it sharpens less. Try 0.6 if faces change."}),
+                    "tooltip": "How much the re-draw is allowed to change. 0.6 (default) "
+                               "keeps faces close to the chain's frames; 0.8 = the original "
+                               "Regen2K recipe, sharper but faces drift more."}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {

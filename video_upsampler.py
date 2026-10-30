@@ -504,15 +504,15 @@ class HTCVideoUpsampler:
                 "chunking": ("BOOLEAN", {"default": True, "tooltip": _tu.CHUNKING_TIP}),
                 "tiling": ("BOOLEAN", {"default": True, "tooltip": _tu.TILING_TIP}),
                 "redraw_start": ("FLOAT", {
-                    "default": 0.8, "min": 0.3, "max": 0.95, "step": 0.05,
-                    "tooltip": ("How much the re-draw is allowed to change. 0.8 = the Regen2K "
-                                "recipe. Lower stays closer to your clip: faces drift less, but "
-                                "it sharpens less. 0.6 is a good place to start if faces "
-                                "change.")}),
+                    "default": 0.6, "min": 0.3, "max": 0.95, "step": 0.05,
+                    "tooltip": ("How much the re-draw is allowed to change. 0.6 (default) keeps "
+                                "faces close to your clip. 0.8 = the original Regen2K recipe: "
+                                "sharper, but faces drift more. Lower than 0.6 changes less "
+                                "again and sharpens less.")}),
                 "redraw_steps": (list(REDRAW_STEPS), {
                     "default": REDRAW_STEPS[0],
-                    "tooltip": ("Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster and "
-                                "sharpens less; compare side by side if 3 looks oversharpened.")}),
+                    "tooltip": ("Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster; "
+                                "in side-by-side tests it looked the same.")}),
             },
             "optional": {
                 "conditioning": ("CONDITIONING", {"tooltip": (
@@ -546,7 +546,7 @@ class HTCVideoUpsampler:
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
             attention="dense", chunk_join="stepped", chunking=True, tiling=True,
-            redraw_start=0.8, redraw_steps=REDRAW_STEPS[0], audio=None,
+            redraw_start=0.6, redraw_steps=REDRAW_STEPS[0], audio=None,
             audio_vae=None, conditioning=None, fps=None):
         check_vae(vae)
         n = int(images.shape[0])
@@ -584,7 +584,7 @@ def check_vae(vae):
 def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
            tile_tokens, sampler_name, redraw_seed, audio, audio_vae, conditioning, fps,
            attention="dense", chunk_join="stepped", chunking=True, tiling=True,
-           redraw_start=0.8, redraw_steps=REDRAW_STEPS[0]):
+           redraw_start=0.6, redraw_steps=REDRAW_STEPS[0]):
     """Steps 2-4 for a clip already encoded: `video` is the H3 video latent of
     `n` frames padded to `valid_length(n)`. -> (upsampled video latent, report)."""
     import comfy.nested_tensor as nt
@@ -745,7 +745,7 @@ class HTCVideoUpsamplerToFile:
 
     def run(self, video, model, vae, upscale_model, megapixels, denoise, lora, tile_tokens,
             sampler_name, redraw_seed=REGEN2K_SEED, attention="dense",
-            chunk_join="stepped", chunking=True, tiling=True, redraw_start=0.8,
+            chunk_join="stepped", chunking=True, tiling=True, redraw_start=0.6,
             redraw_steps=REDRAW_STEPS[0], frame_gen="off",
             codec="auto", quality="max", filename_prefix="video/H3_upsampled",
             frame_rate=FRAME_RATES[0], reuse_encoded=True,

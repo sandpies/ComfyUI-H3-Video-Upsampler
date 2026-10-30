@@ -38,8 +38,8 @@ ComfyUI uses the bundled copy, chunk by chunk, with the same checkpoint.
 | `attention` | `dense` (default) or `sparse`: ComfyUI's sparse attention, much faster on long clips but approximate, so compare faces. Runs dense on a ComfyUI without it |
 | `chunk_join` | How the overlapping pieces of a long clip are joined. **`stepped` (default):** all pieces, and all tiles when a frame has to be tiled, are re-drawn together and merged after every step, so faces don't change at a join and VRAM stays at one piece's worth. `crossfade`: each piece on its own, overlaps blended (the old way; a face can shift at a join) |
 | `chunking` / `tiling` | On (default) = the work may be split when it's too much for the GPU; neither forces a split. Chunking cuts the clip into overlapping pieces of about 4 s; tiling also cuts frames into tiles, only when even a short piece doesn't fit. **Both off = the whole clip in one pass**, for short clips on big cards. With tiling off, running out of VRAM stops with a message saying what to change |
-| `redraw_start` | How much the re-draw may change. **0.8 = the Regen2K recipe.** Lower stays closer to your clip: faces drift less, at the cost of less sharpening. **0.6** is a good start if faces change |
-| `redraw_steps` | **3 (recipe)** or **2**: a third faster and sharpens less. Compare side by side |
+| `redraw_start` | How much the re-draw may change. **0.6 (default)** keeps faces close to your clip. 0.8 = the original Regen2K recipe: sharper, but faces drift more. Lower than 0.6 changes less again. The rest of the schedule follows automatically (0.6 → 0.48 → 0.3 → 0 at 3 steps) |
+| `redraw_steps` | **3 (recipe)** or **2**: a third faster, and looked the same in side-by-side tests |
 | `fps` (optional input) | The clip's frame rate (from Video Frames). Needed for lip sync when the clip isn't 24 fps: what the re-draw hears is retimed to match. The output soundtrack is always the original |
 | `conditioning` (optional input) | A text prompt (CLIPTextEncode, H3 text encoder) describing the clip. Unwired works well for most clips. See *Guiding the re-draw* |
 
@@ -156,8 +156,7 @@ help:
 - **`redraw_start`** sets how much the re-draw may change. Side-by-side tests
   traced face drift to the re-draw itself (not the upscaler, seed, LoRA
   strength or prompt), and starting at **0.6** instead of 0.8 kept faces
-  closest to the source, with a little less sharpening. `redraw_steps` 2
-  sharpens less again.
+  closest to the source, with a little less sharpening, so 0.6 is the default.
 - **`conditioning`** says what the clip is. Wire `CLIPTextEncode` with the H3
   text encoder and either type a caption or feed it a VLM's (Qwen-VL, Florence,
   etc.) description of a few frames. Every spatial tile hears the whole prompt,
