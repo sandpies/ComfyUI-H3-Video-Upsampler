@@ -44,6 +44,7 @@ more, smaller tiles -- less VRAM, more forwards, the same feathered merge.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -300,15 +301,23 @@ def _to_float(x):
     return x.float().div_(255.0) if x.dtype == torch.uint8 else x
 
 
+def decodable_audio(container):
+    """The last audio stream FFmpeg can decode, or None. A stream without a
+    codec context (an iPhone's spatial-audio APAC track) crashes the process
+    when decoded, so it is never picked."""
+    return next((a for a in reversed(container.streams.audio)
+                 if a.codec_context is not None), None)
+
+
 def read_audio(source, start, duration):
     """The file's soundtrack as an AUDIO dict (trimmed like the frames), or None."""
     import av
     import numpy as np
     try:
         with av.open(source, mode="r") as container:
-            if not container.streams.audio:
+            ast = decodable_audio(container)
+            if ast is None:
                 return None
-            ast = container.streams.audio[-1]
             sr = int(ast.sample_rate or 0)
             if sr <= 0:
                 return None
@@ -983,9 +992,137 @@ class HTCVideoFrames:
               f"{images.numel() * 4 / 1048576.0:.0f} MB", flush=True)
         return (images, audio, fps, n, video)
 
+
+# --- a video from a path ----------------------------------------------------
+#
+# Core's Load Video reads from ComfyUI's input folder, and a browser upload
+# above 100 MB is refused unless ComfyUI starts with --max-upload-size. This
+# loader reads the file where it is: nothing is uploaded or copied. The idea
+# (a VIDEO from a typed path, re-run on the file's size and mtime) follows
+# silveroxides' UC_LoadVideoPath; the code is this pack's own.
+
+def resolve_video_path(path):
+    """A typed path -> an absolute file path, or "" when empty. Surrounding
+    quotes (Windows' Copy as path) are dropped, and a relative path is looked
+    up in ComfyUI's input folder."""
+    import os
+    p = str(path or "").strip().strip('"').strip("'").strip()
+    if not p:
+        return ""
+    p = os.path.expanduser(os.path.expandvars(p))
+    if not os.path.isabs(p):
+        try:
+            import folder_paths
+            p = os.path.join(folder_paths.get_input_directory(), p)
+        except Exception:  # noqa: BLE001
+            p = os.path.abspath(p)
+    return os.path.normpath(p)
+
+
+def probe_video(path):
+    """What the file is, from its headers only: a dict, or raises ValueError
+    when there is no readable video stream."""
+    import av
+    try:
+        with av.open(path, mode="r") as c:
+            if not c.streams.video:
+                raise ValueError("no video stream")
+            v = c.streams.video[0]
+            ctx = v.codec_context
+            avg = float(v.average_rate) if v.average_rate else 0.0
+            base = float(v.base_rate) if getattr(v, "base_rate", None) else avg
+            dur = (float(v.duration * v.time_base) if v.duration else
+                   float(c.duration) / 1e6 if c.duration else 0.0)
+            frames = int(v.frames or 0)
+            fmt = ctx.format if ctx is not None else None
+            bits = max((int(x.bits) for x in fmt.components), default=8) if fmt is not None else 8
+            a = decodable_audio(c)
+            return {
+                "width": int(ctx.width) if ctx is not None else 0,
+                "height": int(ctx.height) if ctx is not None else 0,
+                "fps": avg, "variable_rate": bool(avg and base and abs(avg - base) / base > 0.01),
+                "frames": frames or int(round(dur * avg)), "frames_exact": bool(frames),
+                "duration": dur, "codec": v.codec_context.name if ctx is not None else "?",
+                "bits": bits,
+                "audio": (f"{a.codec_context.name} {a.sample_rate} Hz {a.channels} ch"
+                          if a is not None else ("undecodable track ignored"
+                                                 if len(c.streams.audio) else "none")),
+                "size_mb": os.path.getsize(path) / 1e6,
+            }
+    except ValueError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"not a readable video ({exc})") from None
+
+
+def describe_video(info):
+    rate = f"{info['fps']:.3f}".rstrip("0").rstrip(".")
+    return (f"{info['width']}x{info['height']}, {rate} fps"
+            + (" (VARIABLE frame rate: frames are timed by count, so picture and sound may "
+               "drift; convert to a constant rate first for long clips)" if info["variable_rate"] else "")
+            + f", {'' if info['frames_exact'] else '~'}{info['frames']} frames, "
+            f"{info['duration']:.2f} s, {info['codec']} {info['bits']}-bit, "
+            f"audio: {info['audio']}, {info['size_mb']:.0f} MB")
+
+
+class HTCLoadVideoPath:
+    """A VIDEO from a file path: no upload, no copy, no size limit."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"path": ("STRING", {
+            "default": "", "multiline": False,
+            "placeholder": "D:/videos/clip.mp4 (or a name in ComfyUI/input)",
+            "tooltip": ("The video file. Paste a full path (quotes from Copy as path are fine), "
+                        "or a name relative to ComfyUI's input folder. Read in place: nothing is "
+                        "uploaded or copied, so there is no upload size limit.")})}}
+
+    RETURN_TYPES = ("VIDEO", "FLOAT", "INT", "STRING")
+    RETURN_NAMES = ("video", "fps", "frame_count", "info")
+    FUNCTION = "run"
+    CATEGORY = "video/upscale"
+    DESCRIPTION = ("Load Video without the upload: reads the file where it is (no 100 MB upload "
+                   "limit, no copy into input/), and reports its size, frame rate, length, codec "
+                   "and audio.")
+
+    @classmethod
+    def IS_CHANGED(cls, path):
+        import os
+        p = resolve_video_path(path)
+        try:
+            st = os.stat(p)
+            return f"{p}|{st.st_size}|{st.st_mtime_ns}"
+        except OSError:
+            return p
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, path):
+        import os
+        p = resolve_video_path(path)
+        if not p:
+            return "No video path given."
+        if not os.path.isfile(p):
+            return f"No file at {p}"
+        try:
+            probe_video(p)
+        except ValueError as exc:
+            return f"{p}: {exc}"
+        return True
+
+    def run(self, path):
+        from comfy_api.latest import InputImpl
+        p = resolve_video_path(path)
+        info = probe_video(p)
+        text = f"{os.path.basename(p)}: {describe_video(info)}"
+        print(f"[{TAG}] {text}", flush=True)
+        return {"ui": {"text": [text]},
+                "result": (InputImpl.VideoFromFile(p), float(info["fps"]), int(info["frames"]), text)}
+
 NODE_CLASS_MAPPINGS = {"H3VideoUpsampler": HTCVideoUpsampler,
                        "H3VideoUpsamplerToFile": HTCVideoUpsamplerToFile,
-                       "H3VideoFrames": HTCVideoFrames}
+                       "H3VideoFrames": HTCVideoFrames,
+                       "H3LoadVideoPath": HTCLoadVideoPath}
 NODE_DISPLAY_NAME_MAPPINGS = {"H3VideoUpsampler": "H3 Video Upsampler",
                               "H3VideoUpsamplerToFile": "H3 Video Upsampler (file to file)",
-                              "H3VideoFrames": "H3 Video Frames (lean)"}
+                              "H3VideoFrames": "H3 Video Frames (lean)",
+                              "H3LoadVideoPath": "H3 Load Video (path)"}

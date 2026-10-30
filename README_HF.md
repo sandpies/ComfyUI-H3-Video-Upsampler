@@ -107,6 +107,28 @@ Two more widgets:
 A VIDEO trimmed or cropped upstream is read with core's own rules (trim
 window, rotation, even-pixel crop), still a chunk at a time.
 
+## The node: H3 Load Video (path)
+
+Core's Load Video reads from `ComfyUI/input`, and ComfyUI refuses browser
+uploads over 100 MB unless it's started with `--max-upload-size`. This node
+reads the file **where it is**: nothing is uploaded or copied, so there's no
+size limit and no duplicate of a multi-GB file.
+
+- **`path`**: paste a full path (Windows' *Copy as path* quotes are fine),
+  or a name relative to `ComfyUI/input`.
+- **Outputs:** a normal `VIDEO` for the file-to-file node, Video Frames or any
+  core video node, plus `fps`, `frame_count` and an `info` line (resolution,
+  fps, frame count, duration, codec, bit depth, audio, file size). Wire `info`
+  to Preview Any to see it. It's also printed to the console.
+- A **variable frame rate** (common in phone and screen recordings) is flagged.
+  Frames are timed by count, so convert such files to a constant rate before
+  long runs.
+- It re-runs only when the file changes (size or modified time). A wrong path
+  or a file that isn't a video is reported when you queue.
+
+It can open any video the ComfyUI process can read, so on a ComfyUI shared
+with other people, keep that in mind.
+
 ## The node: H3 Video Frames (lean)
 
 A drop-in for **Get Video Components** after Load Video: the same `images`,

@@ -47,8 +47,7 @@ Read it before using the LoRA commercially.
 
 ## Ideas from ComfyUI-UtilsCollection (no code copied)
 
-The file-to-file and Video Frames nodes' streamed reading, the latent cache
-and the 24 fps re-timing follow ideas from **[silveroxides](https://github.com/silveroxides)'**
+The file-to-file, Video Frames and Load Video (path) nodes follow ideas from **[silveroxides](https://github.com/silveroxides)'**
 [`ComfyUI-UtilsCollection`](https://github.com/silveroxides/ComfyUI-UtilsCollection)
 (AGPL-3.0), from its H3 reference-video path:
 
@@ -56,6 +55,8 @@ and the 24 fps re-timing follow ideas from **[silveroxides](https://github.com/s
   instead of assembling the whole clip as one tensor;
 - keying decoded media to the file's content, so a rerun skips the decode;
 - resampling to H3's 24 fps by nearest frame.
+- loading a VIDEO from a typed path, re-run on the file's size and mtime
+  (`UC_LoadVideoPath`).
 
 The code in `video_upsampler.py` was written fresh for this pack and shares
 none of that repository's code. silveroxides agreed to this on the condition
