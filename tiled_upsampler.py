@@ -63,6 +63,7 @@ SCHEDULER, STEPS, DENOISE = "simple", 1, 0.2
 SEED = 444
 UPSCALER_DTYPE = torch.float16
 _FLUSH_S = [0.0]           # seconds spent in sample_tile's cache flush (log only)
+_SAMPLE_S = [0.0]          # seconds spent inside the sampler itself (log only)
 _LAST_OOM = [0]            # OOM retries in the most recent redraw_chunk call (log only)
 _LAST_BUDGET = [TOKEN_BUDGET]  # budget redraw_chunk / upsample finished at
 _LAST_TOKENS = [0]          # tokens per forward of the last redraw_chunk grid (incl. cond rows)
@@ -1269,10 +1270,12 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=No
             mp.create_model_options_clone(guider.model_options), lock)
     callback = latent_preview.prepare_callback(
         guider.model_patcher, sigmas.shape[-1] - 1, {})
+    _ts = time.perf_counter()
     out = guider.sample(nt.NestedTensor(noise), samples, sampler, sigmas,
                         denoise_mask=mask, callback=callback,
                         disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
                         seed=seed)
+    _SAMPLE_S[0] += time.perf_counter() - _ts
     res = out.to(mm.intermediate_device()).tensors[0]
     del out, guider, samples, mask
     _t = time.perf_counter()
@@ -1678,6 +1681,7 @@ def redraw_stepped(model, plan, videos, audios, conds, sampler, sigmas, seed,
         del g, src
     wsum = wsum.clamp(min=1e-8)
     x = film
+    _t0, _FLUSH_S[0], _SAMPLE_S[0] = time.perf_counter(), 0.0, 0.0
     for step in range(len(sigmas) - 1):
         two = sigmas[step:step + 2]
         acc = torch.zeros_like(x, dtype=torch.float32)
@@ -1702,11 +1706,16 @@ def redraw_stepped(model, plan, videos, audios, conds, sampler, sigmas, seed,
                 del ot, xt
         x = (acc / wsum).to(dtype=dt)
         del acc
+    _wall = time.perf_counter() - _t0
     n_tiles = sum(len(c_) for c_ in work)
     tiled = sorted({f"{a}x{b}" for a, b in grids if (a, b) != (1, 1)})
     notes.insert(0, f"{len(plan)} chunks" + (f" in {n_tiles} tiles ({', '.join(tiled)} per tiled chunk)"
                                              if tiled else "")
                  + f" x {len(sigmas) - 1} steps in {n_tiles * (len(sigmas) - 1)} sampler calls")
+    _calls = max(1, n_tiles * (len(sigmas) - 1))
+    notes.append(f"time: {_SAMPLE_S[0]:.1f} s sampling ({_SAMPLE_S[0] / _calls:.2f} s a call), "
+                 f"{_FLUSH_S[0]:.1f} s cache flush, "
+                 f"{max(0.0, _wall - _SAMPLE_S[0] - _FLUSH_S[0]):.1f} s setup and merging")
     return x, notes
 
 
