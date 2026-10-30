@@ -188,24 +188,63 @@ def decode_slices(decode, vid, n, slice_t=30, warm_t=5, tail_t=2):
 # (the H3 VAE encodes every 17 frames on their own, so 102-frame pieces give
 # the very latent the whole clip does), redraws exactly as the IMAGE node does,
 # and decodes slice by slice straight into H3 Save Video's encoder.
+#
+# Three ideas here come from silveroxides' ComfyUI-UtilsCollection (its H3
+# reference-video path), written fresh for this pack -- no code is shared:
+# decoding a VIDEO in batches with core's own semantics instead of assembling
+# the clip, keying decoded media to the file's content so a rerun skips the
+# decode, and resampling to H3's 24 fps by nearest frame on read.
 
 READ_FRAMES = 102           # frames read and encoded at a time: 6 VAE clips of 17
+FRAME_RATES = ("source", "24 (H3 native)")
+LATENT_CACHE_DIR = "htc_upsampler_latents"   # under ComfyUI's temp dir (cleared at start)
+LATENT_CACHE_KEEP = 4       # encoded clips kept on disk, newest first
 
 
 def _video_file(video):
-    """The VIDEO's file source and trim window when frames can be read from it
-    directly, else None (components, a list, a crop: read whole instead)."""
+    """(source, start, duration, crop) when frames can be read from the VIDEO's
+    file directly, else None (components or a list: read whole instead). Core
+    has no public accessor for a crop, so it is read off the instance."""
     if type(video).__name__ != "VideoFromFile" or not hasattr(video, "get_stream_source"):
         return None
-    if getattr(video, "_VideoFromFile__crop", None) is not None:
-        return None
     start, duration = video.get_active_trim_window()
-    return video.get_stream_source(), float(start), float(duration)
+    crop = getattr(video, "_VideoFromFile__crop", None)
+    return video.get_stream_source(), float(start), float(duration), crop
 
 
-def read_frames(source, start, duration, k):
-    """[<=k, H, W, 3] float32 batches, 0..1, decoded from the file in order (the
-    trim window and rotation as ComfyUI's own loader applies them)."""
+def crop_rect(crop, width, height):
+    """A VIDEO crop (x, y, w, h) fitted to a width x height frame the way core
+    fits it: inside the frame, on even pixels, None when it is the whole frame
+    or empty."""
+    x, y, w, h = (int(v) for v in crop)
+    if w <= 0 or h <= 0:
+        return None
+    x = max(0, min(x, width - 1)) // 2 * 2
+    y = max(0, min(y, height - 1)) // 2 * 2
+    w, h = min(w, width - x), min(h, height - y)
+    if (x, y, w, h) == (0, 0, width, height):
+        return None
+    w, h = w // 2 * 2, h // 2 * 2
+    return (x, y, w, h) if w > 0 and h > 0 else None
+
+
+def nearest_frames(frames, src_fps, out_fps):
+    """`frames` (any per-frame iterable at `src_fps`) re-timed to `out_fps`:
+    output frame j shows the source frame nearest to its time j / out_fps, so
+    frames are dropped above the rate and repeated below it and the clip keeps
+    its real duration (and its soundtrack's sync)."""
+    ratio = float(src_fps) / float(out_fps)
+    j = 0
+    for i, frame in enumerate(frames):
+        while math.floor(j * ratio + 0.5) == i:
+            yield frame
+            j += 1
+
+
+def decode_frames(source, start, duration, crop=None):
+    """The file's frames one at a time as HxWx3 arrays (uint8, or float32 0..1
+    for sources deeper than 8 bits), with the trim window, rotation and crop
+    applied as ComfyUI's own loader applies them."""
     import av
     import numpy as np
     try:
@@ -219,7 +258,7 @@ def read_frames(source, start, duration, k):
         end_pts = int((start + duration) / vs.time_base)
         if start_pts:
             container.seek(start_pts, stream=vs)
-        buf, fmt = [], None
+        fmt, rect = None, False
         for frame in container.decode(vs):
             if frame.pts is not None and frame.pts < start_pts:
                 continue
@@ -232,13 +271,29 @@ def read_frames(source, start, duration, k):
             img = img.astype(np.float32) / 65535.0 if fmt == "rgb48le" else img
             q = _rotation_quadrant(frame) if _rotation_quadrant is not None else 0
             if q:
-                img = np.rot90(img, k=q, axes=(0, 1)).copy()
-            buf.append(torch.from_numpy(img))
-            if len(buf) == k:
-                yield _to_float(torch.stack(buf))
-                buf = []
-        if buf:
+                img = np.rot90(img, k=q, axes=(0, 1))
+            if rect is False:
+                rect = crop_rect(crop, img.shape[1], img.shape[0]) if crop is not None else None
+            if rect is not None:
+                x, y, w, h = rect
+                img = img[y:y + h, x:x + w]
+            yield np.ascontiguousarray(img)
+
+
+def read_frames(source, start, duration, k, crop=None, src_fps=None, out_fps=None):
+    """[<=k, H, W, 3] float32 batches, 0..1, decoded from the file in order;
+    re-timed to `out_fps` by nearest frame when both rates are given."""
+    frames = decode_frames(source, start, duration, crop)
+    if src_fps and out_fps and abs(float(src_fps) - float(out_fps)) > 1e-3:
+        frames = nearest_frames(frames, src_fps, out_fps)
+    buf = []
+    for img in frames:
+        buf.append(torch.from_numpy(img))
+        if len(buf) == k:
             yield _to_float(torch.stack(buf))
+            buf = []
+    if buf:
+        yield _to_float(torch.stack(buf))
 
 
 def _to_float(x):
@@ -274,6 +329,81 @@ def read_audio(source, start, duration):
     except Exception as exc:  # noqa: BLE001
         print(f"[{TAG}] soundtrack not read ({exc!r}); conditioning on silence", flush=True)
         return None
+
+
+def file_fingerprint(source):
+    """What identifies the file's content, cheaply: path, size, mtime and the
+    first and last MiB (a path), or every byte (an in-memory upload)."""
+    import hashlib
+    import os
+    h = hashlib.sha256()
+    if isinstance(source, (str, os.PathLike)):
+        st = os.stat(source)
+        h.update(f"{os.path.abspath(source)}|{st.st_size}|{st.st_mtime_ns}".encode())
+        with open(source, "rb") as f:
+            h.update(f.read(1 << 20))
+            if st.st_size > 2 << 20:
+                f.seek(-(1 << 20), os.SEEK_END)
+                h.update(f.read(1 << 20))
+    else:
+        source.seek(0)
+        h.update(source.read())
+        source.seek(0)
+    return h.hexdigest()
+
+
+def vae_fingerprint(vae):
+    """Which VAE weights encoded a latent: class, parameter count and the sums
+    of the first and last parameter (a different file differs in all three).
+    None when the weights cannot be read (the cache is then skipped)."""
+    fsm = getattr(vae, "first_stage_model", vae)
+    try:
+        params = list(fsm.parameters()) if hasattr(fsm, "parameters") else []
+        if not params:
+            return type(fsm).__name__
+        total = sum(int(p.numel()) for p in params)
+        ends = [float(p.detach().float().sum()) for p in (params[0], params[-1])]
+    except Exception:  # noqa: BLE001 -- quantized or offloaded weights
+        return None
+    return f"{type(fsm).__name__}|{total}|{ends[0]:.6e}|{ends[1]:.6e}"
+
+
+def _cache_dir():
+    import os
+    import folder_paths
+    return os.path.join(folder_paths.get_temp_directory(), LATENT_CACHE_DIR)
+
+
+def cache_load(key):
+    """The encoded clip stored under `key`, or None."""
+    import os
+    path = os.path.join(_cache_dir(), key + ".pt")
+    if not os.path.isfile(path):
+        return None
+    try:
+        got = torch.load(path, map_location="cpu", weights_only=True)
+        os.utime(path)          # newest-first pruning keeps what is in use
+        return got
+    except Exception as exc:  # noqa: BLE001 -- a broken entry is just a miss
+        print(f"[{TAG}] latent cache entry unreadable ({exc!r}); re-encoding", flush=True)
+        return None
+
+
+def cache_store(key, entry):
+    """Store an encoded clip, keeping the newest LATENT_CACHE_KEEP."""
+    import os
+    d = _cache_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, key + ".tmp")
+        torch.save(entry, tmp)
+        os.replace(tmp, os.path.join(d, key + ".pt"))
+        files = sorted((os.path.join(d, f) for f in os.listdir(d) if f.endswith(".pt")),
+                       key=os.path.getmtime, reverse=True)
+        for old in files[LATENT_CACHE_KEEP:]:
+            os.remove(old)
+    except OSError as exc:
+        print(f"[{TAG}] latent cache not written ({exc!r})", flush=True)
 
 
 def encode_video_streamed(vae, batches, seg=READ_FRAMES):
@@ -585,6 +715,16 @@ class HTCVideoUpsamplerToFile:
         except Exception:  # noqa: BLE001 -- PyAV missing: the node fails at run time
             pass
         req["filename_prefix"] = ("STRING", {"default": "video/H3_upsampled"})
+        req["frame_rate"] = (list(FRAME_RATES), {"default": FRAME_RATES[0], "tooltip": (
+            "source = every frame of the file. 24 = re-timed to H3's own rate on read "
+            "(nearest frame: dropped above 24, repeated below), so the soundtrack lines "
+            "up exactly and a 48 fps clip costs half the re-draw. Set frame_gen x2 to "
+            "save 48 again.")})
+        req["reuse_encoded"] = ("BOOLEAN", {"default": True, "tooltip": (
+            "Keep the encoded clip (about 100 MB a minute) in ComfyUI's temp folder, "
+            "keyed to the file's content, trim, crop, frame_rate and VAE, so the next "
+            "run on the same clip skips reading and encoding. The temp folder is "
+            "cleared when ComfyUI starts.")})
         opt = {k: v for k, v in base["optional"].items()
                if k in ("audio_vae", "conditioning")}
         return {"required": req, "optional": opt,
@@ -605,28 +745,56 @@ class HTCVideoUpsamplerToFile:
             sampler_name, redraw_seed=REGEN2K_SEED, structure_lock=0.0,
             lock_sigma=_tu.LOCK_SIGMA, off_24_audio=OFF_24_AUDIO[0], frame_gen="off",
             codec="auto", quality="max", filename_prefix="video/H3_upsampled",
+            frame_rate=FRAME_RATES[0], reuse_encoded=True,
             audio_vae=None, conditioning=None, prompt=None, extra_pnginfo=None):
+        import hashlib
+        import json
         import time
         from . import save_video as _sv
 
         check_vae(vae)
         t0 = time.perf_counter()
+        to_24 = str(frame_rate) != FRAME_RATES[0]
         src = _video_file(video)
+        key = None
         if src is not None:
-            fps = float(video.get_frame_rate())
-            source, start, duration = src
+            src_fps = float(video.get_frame_rate())
+            source, start, duration, crop = src
+            fps = float(H3_FPS) if to_24 else src_fps
             audio = read_audio(source, start, duration)
-            batches = read_frames(video.get_stream_source(), start, duration, READ_FRAMES)
-            how = "read from the file a chunk at a time"
+            vae_id = vae_fingerprint(vae) if reuse_encoded else None
+            if vae_id:
+                key = hashlib.sha256(json.dumps([
+                    1, file_fingerprint(video.get_stream_source()), start, duration,
+                    list(crop) if crop is not None else None, fps, READ_FRAMES,
+                    vae_id]).encode()).hexdigest()[:40]
+            hit = cache_load(key) if key else None
+            if hit is not None:
+                lat, n, src_size = hit["latent"], int(hit["n"]), tuple(hit["src_size"])
+                how = "encoded latent reused (same file, trim, crop, rate and VAE)"
+            else:
+                batches = read_frames(video.get_stream_source(), start, duration, READ_FRAMES,
+                                      crop, src_fps, fps if to_24 else None)
+                how = ("read from the file a chunk at a time"
+                       + (f", re-timed {src_fps:g} -> {fps:g} fps" if to_24 and abs(src_fps - fps) > 1e-3
+                          else ""))
         else:
             comp = video.get_components()
             audio, imgs = comp.audio, comp.images
-            fps = float(comp.frame_rate)
+            src_fps = float(comp.frame_rate)
+            fps = float(H3_FPS) if to_24 else src_fps
+            if to_24 and abs(src_fps - fps) > 1e-3:
+                pick = list(nearest_frames(range(int(imgs.shape[0])), src_fps, fps))
+                imgs = imgs[pick]
             batches = (imgs[s:s + READ_FRAMES] for s in range(0, int(imgs.shape[0]), READ_FRAMES))
-            how = "not a plain file (components, list or crop): decoded whole"
-        lat, n, src_size = encode_video_streamed(vae, batches)
+            how = "not a plain file (components or list): decoded whole"
+            hit = None
+        if hit is None:
+            lat, n, src_size = encode_video_streamed(vae, batches)
+            if key:
+                cache_store(key, {"latent": lat, "n": n, "src_size": list(src_size)})
         t1 = time.perf_counter()
-        print(f"[{TAG}] {n} frames at {fps:g} fps {how}, encoded in {t1 - t0:.1f} s "
+        print(f"[{TAG}] {n} frames at {fps:g} fps, {how}, in {t1 - t0:.1f} s "
               f"({int(lat.shape[2])} latent steps, {lat.numel() * lat.element_size() / 1048576.0:.0f} MB)",
               flush=True)
         vid, report = redraw(

@@ -44,3 +44,19 @@ A rank-256 compression of the
 LoRA, redistributed under its license, the
 [MiniMax H3 community license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/6818f6c32d12b210915e44ad56a4228c2608f160/LICENSE).
 Read it before using the LoRA commercially.
+
+## Ideas from ComfyUI-UtilsCollection (no code copied)
+
+The file-to-file node's streamed reading, its latent cache and its 24 fps
+re-timing follow ideas from **[silveroxides](https://github.com/silveroxides)'**
+[`ComfyUI-UtilsCollection`](https://github.com/silveroxides/ComfyUI-UtilsCollection)
+(AGPL-3.0), from its H3 reference-video path:
+
+- decoding a VIDEO in batches with core's own trim, rotation and crop rules,
+  instead of assembling the whole clip as one tensor;
+- keying decoded media to the file's content, so a rerun skips the decode;
+- resampling to H3's 24 fps by nearest frame.
+
+The code in `video_upsampler.py` was written fresh for this pack and shares
+none of that repository's code. silveroxides agreed to this on the condition
+that the ideas are credited, which is what this section does.

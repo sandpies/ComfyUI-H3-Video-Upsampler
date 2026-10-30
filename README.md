@@ -77,6 +77,24 @@ soundtrack come from the file, so `off_24_audio` always knows the real rate.
 Widgets are the IMAGE node's, plus H3 Save Video's `frame_gen`, `codec`,
 `quality` and `filename_prefix`.
 
+Two more widgets:
+
+- **`frame_rate`**: `source` keeps every frame of the file. `24 (H3 native)`
+  re-times the clip on read: each output frame is the source frame nearest
+  its time on a 24 fps clock, so frames are dropped above 24 and repeated
+  below. The real duration is kept, so the soundtrack lines up exactly with
+  no retiming. For a 48 fps clip interpolated from a 24 fps render, this
+  gets back the original frames and halves the re-draw; `frame_gen` x2
+  saves 48 fps again.
+- **`reuse_encoded`** (on): the encoded clip (about 100 MB a minute) is kept
+  in ComfyUI's temp folder, keyed to the file's content, trim, crop,
+  `frame_rate` and VAE. The next run on the same clip skips reading and
+  encoding, which helps A/B runs of `structure_lock` or seeds. Up to 4 clips
+  are kept, and the temp folder is cleared when ComfyUI starts.
+
+A VIDEO trimmed or cropped upstream is read with core's own rules (trim
+window, rotation, even-pixel crop), still a chunk at a time.
+
 ## Guiding the re-draw
 
 The re-draw starts from sigma 0.8, which is mostly noise. With zeroed-out
