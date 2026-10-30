@@ -20,6 +20,11 @@ detail -- the same upsampler Hand-Tie-Clips runs over a whole chain. Mouths, mot
 Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
 `minimax_h3_fl2va_pruned_int8_convrot` DiT, video and audio VAE).
 
+On a ComfyUI from 28 October 2026 on, the 3D upscale runs through core's own
+H3 latent upscaler (Kijai): the whole clip in one pass with clip-wide statistics, so
+every chunk starts the re-draw from one consistently toned film, and faster. Older
+ComfyUI uses the bundled copy, chunk by chunk, with the same checkpoint.
+
 ## The node: H3 Video Upsampler
 
 | widget | what it does |
@@ -200,5 +205,5 @@ it with the Regen2K LoRA and the old file is gone from `lora/`.
 Built in [ComfyUI-Hand-Tie-Clips](https://github.com/sandpies/ComfyUI-Hand-Tie-Clips), where the same upsampler runs over a
 whole chain. Latent upscaler network: LBH-123-AI. Upscale recipe: bbaudio-2025's
 MMH3 Ultimate Upscale. Open-H3-Regenerate-2K refiner and 3-step schedule: NVlabs
-(`Efficient-Large-Model/Open-H3-Regenerate-2K`) and Kijai. Guide layout and
+(`Efficient-Large-Model/Open-H3-Regenerate-2K`) and Kijai. Core's H3 latent upscaler, used when present: Kijai. Guide layout and
 dataset of the retired LoRA: Alissonerdx. See `THIRD_PARTY_NOTICES.md`.

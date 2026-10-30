@@ -953,6 +953,99 @@ def upscale_chunks_batch(videos, name, w_px, h_px):
 _DEFAULT_UPSCALE_CHUNK = upscale_chunk
 
 
+# --- the upscaler through ComfyUI core, when it has it ----------------------
+#
+# Core (Kijai, ComfyUI PR #17412) runs the same network with its GroupNorm
+# statistics taken over the whole clip while working 16 latent frames at a
+# time. So the film is upscaled ONCE and every chunk is cut from it: no chunk
+# starts the re-draw toned a little differently from its neighbour, which is
+# what upscaling chunk by chunk does (each chunk normalised over its own span).
+# Without it (older ComfyUI), or when the whole film does not fit, the chunks
+# are upscaled one by one as before.
+
+def _core_upscaler(name):
+    """Core's model patcher for `name`, loaded by core's own Load Latent Upscale
+    Model, or None when this ComfyUI has no H3 upscaler (or the file isn't one)."""
+    key = "core:" + str(name)
+    if key in _NET:
+        return _NET[key]
+    try:
+        from comfy.ldm.minimax.latent_upscaler import MiniMaxH3LatentUpscaler
+        from comfy_extras.nodes_hunyuan import LatentUpscaleModelLoader
+    except Exception:  # noqa: BLE001 -- ComfyUI before Oct 2026
+        return None
+    try:
+        patcher = LatentUpscaleModelLoader.execute(name).args[0]
+    except Exception as exc:  # noqa: BLE001 -- e.g. an `upscaler.`-prefixed file
+        print(f"[{TAG}] core could not load {name!r} ({exc}); the bundled upscaler "
+              "instead", flush=True)
+        return None
+    if not isinstance(getattr(patcher, "model", None), MiniMaxH3LatentUpscaler):
+        return None
+    _NET.clear()
+    _NET[key] = patcher
+    print(f"[{TAG}] upscaler {name}: ComfyUI core's (whole-clip statistics)", flush=True)
+    return patcher
+
+
+def _core_run(patcher, video, size):
+    import comfy.model_management as mm
+    mm.load_models_gpu([patcher], memory_required=patcher.model.memory_required(video.shape, size))
+    with torch.inference_mode():
+        out = patcher.model(video.to(device=patcher.load_device, dtype=patcher.model_dtype()),
+                            size)
+    return out.to(device="cpu", dtype=video.dtype)
+
+
+def upscale_film(video, plan, name, w_px, h_px):
+    """Every chunk of `plan` upscaled, as `upscale_chunks_batch` returns them.
+
+    Through core when it can: the whole film in one pass when that fits the
+    device, otherwise chunk by chunk with core's faster kernels. Anything else
+    (no core, a monkeypatched `upscale_chunk`, out of memory) is the bundled
+    network chunk by chunk.
+    """
+    raw = [video[:, :, k0:k1].contiguous() for (k0, _f0, k1, _f1) in plan]
+    if upscale_chunk is not _DEFAULT_UPSCALE_CHUNK or not raw:
+        return upscale_chunks_batch(raw, name, w_px, h_px)
+    _, _, tv, h_in, w_in = video.shape
+    h_out = max(1, int(round(h_px / SPATIAL)))
+    w_out = max(1, int(round(w_px / SPATIAL)))
+    if (h_out, w_out) == (h_in, w_in) or h_out < h_in or w_out < w_in:
+        return upscale_chunks_batch(raw, name, w_px, h_px)  # its no-op / its refusal
+    dev = _device()
+    if dev.type == "cuda":
+        _free_all_gpu()
+    patcher = _core_upscaler(name)
+    if patcher is None:
+        return upscale_chunks_batch(raw, name, w_px, h_px)
+    import comfy.model_management as mm
+    size = (int(tv), h_out, w_out)
+    need = patcher.model.memory_required(video.shape, size) + patcher.model_size()
+    whole = len(plan) == 1 or need <= mm.get_free_memory(dev) * MEMORY_HEADROOM
+    try:
+        if whole:
+            film = _core_run(patcher, video, size)
+            out = [film[:, :, k0:k1].contiguous() for (k0, _f0, k1, _f1) in plan]
+            del film
+            if len(plan) > 1:
+                print(f"[{TAG}] 3D upscale: the whole film in one pass "
+                      f"({need / 1073741824:.1f} GB), {len(plan)} chunks cut from it", flush=True)
+        else:
+            print(f"[{TAG}] 3D upscale: the whole film needs {need / 1073741824:.1f} GB, "
+                  f"more than is free; chunk by chunk", flush=True)
+            out = [_core_run(patcher, v, (int(v.shape[2]), h_out, w_out)) for v in raw]
+    except Exception as exc:  # noqa: BLE001
+        if not _is_oom(exc):
+            raise
+        print(f"[{TAG}] 3D upscale through core ran out of memory ({exc}); "
+              "the bundled upscaler chunk by chunk instead", flush=True)
+        out = None
+    finally:
+        _free_all_gpu()
+    return out if out is not None else upscale_chunks_batch(raw, name, w_px, h_px)
+
+
 # --- sampling ---------------------------------------------------------------
 
 def recipe_sigmas(model, denoise=DENOISE, steps=STEPS, start_sigma=0.0):
@@ -1796,7 +1889,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
             _free_all_gpu()
 
     _tp.append(time.perf_counter())
-    upscaled_cvs = upscale_chunks_batch(raw_cvs, upscaler, w_px, h_px)
+    upscaled_cvs = upscale_film(video, plan, upscaler, w_px, h_px)
     anchors = [None] * len(plan)
     if (sigmas is not None and float(structure_lock) > 0.0
             and str(lock_anchor) == "source"):

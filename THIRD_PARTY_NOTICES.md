@@ -17,6 +17,8 @@ trained against. `tools/check_tiled_upsampler.py --weights` runs the real
 checkpoint through this module and through theirs and requires identical
 output. Everything else in the file is this pack's code.
 
+When ComfyUI core has its own H3 latent upscaler (`comfy/ldm/minimax/latent_upscaler.py`, Kijai, [ComfyUI PR #17412](https://github.com/Comfy-Org/ComfyUI/pull/17412), GPL-3.0), `upscale_film` calls it at runtime through core's own Load Latent Upscale Model. None of its code is copied here; the bundled module remains the fallback.
+
 The node's recipe -- chunk and tile sizes, the joint-step tiling, one step at
 denoise 0.2 -- is the one the user proved in bbaudio-2025's
 [Comfyui-MMH3-UltimateUpscale](https://github.com/bbaudio-2025/Comfyui-MMH3-UltimateUpscale) graph (MIT).
