@@ -9,5 +9,7 @@ dependencies = []
 Repository = "https://github.com/sandpies/ComfyUI-H3-Video-Upsampler"
 
 [tool.comfy]
+# comfy.audio (lip-sync retime) arrived in v0.38.0; MiniMax H3 and sparse attention earlier.
+requires-comfyui = ">=0.38.0"
 PublisherId = "sandpies"
 DisplayName = "H3 Video Upsampler"

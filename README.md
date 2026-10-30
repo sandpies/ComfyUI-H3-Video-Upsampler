@@ -17,8 +17,16 @@ detail -- the same upsampler Hand-Tie-Clips runs over a whole chain. Mouths, mot
    (3.77 GB, from this pack's Hugging Face `lora/`) in `ComfyUI/models/loras`.
 3. Load `example_workflows/H3_Video_Upsampler_File.json` (recommended: any length, flat RAM) or `example_workflows/H3_Video_Upsampler.json` (IMAGE in, IMAGE out), pick a clip, queue.
 
-Needs a ComfyUI with MiniMax H3 support and the H3 models (the official
-`minimax_h3_fl2va_pruned_int8_convrot` DiT, video and audio VAE).
+## Requirements
+
+- **ComfyUI v0.38.0 or newer** (29 Sep 2026): MiniMax H3, its sparse attention and the
+  audio resampler the lip-sync retime uses. Older ComfyUI is not supported.
+- **Recommended: ComfyUI master from 28 Oct 2026 or newer** (not in a numbered release
+  as of v0.43.2). It adds core's own H3 latent upscaler (PR #17412, a faster whole-clip
+  pass) and the sol-VAE (PR #17411). On an older build the pack uses its bundled
+  upscaler and the standard VAE, with the same results otherwise.
+- The H3 models: the official `minimax_h3_fl2va_pruned_int8_convrot` DiT, video and
+  audio VAE.
 
 **Faster VAE (optional):** `minimax_h3_sol_vae_fp16.safetensors` in the VAE loader made a
 whole run about 20% faster in tests. Colour and motion were identical; hair edges came out
