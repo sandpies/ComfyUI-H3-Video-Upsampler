@@ -45,6 +45,7 @@ import os
 
 import torch
 
+from . import face_pass as _fp
 from . import tiled_upsampler as _tu
 from . import upscale_guide as _ug
 
@@ -109,6 +110,16 @@ def fit_frames(images, w, h):
         x = images[s:s + 16, ..., :3].movedim(-1, 1)
         out[s:s + 16] = comfy.utils.common_upscale(x, w, h, "lanczos", "disabled").movedim(1, -1)
     return out
+
+
+def slice_audio(audio, t0, t1):
+    """The part of an AUDIO dict from t0 to t1 seconds (None stays None)."""
+    if audio is None:
+        return None
+    sr = int(audio["sample_rate"])
+    wav = audio["waveform"]
+    a, b = max(0, int(round(t0 * sr))), max(0, int(round(t1 * sr)))
+    return {"waveform": wav[..., a:max(a + 1, b)], "sample_rate": sr}
 
 
 def pad_frames(images, length):
@@ -566,8 +577,37 @@ class HTCVideoUpsampler:
             attention, chunk_join, chunking, tiling, redraw_start, redraw_steps)
         img = decode_streamed(vae.decode, vid, n)
         del vid
+        if float(denoise) > 0.0:
+            img = img.float().cpu()
+            img, note = _fp.apply(img, images, close_up_fn(
+                vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
+                redraw_seed, audio, audio_vae, fps, attention, chunk_join, chunking, tiling,
+                redraw_start, redraw_steps), float(fps) if fps else float(H3_FPS))
+            report += note
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
                 report)
+
+
+def close_up_fn(vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
+                redraw_seed, audio, audio_vae, fps, attention="sparse", chunk_join="stepped",
+                chunking=True, tiling=True, redraw_start=0.6, redraw_steps=REDRAW_STEPS[0]):
+    """The small-face close-up re-draw (face_pass) for a clip upsampled with these
+    settings: crops [m, S, S, 3] + their time span -> the same upsampler at
+    face_pass.CROP_OUT, the soundtrack sliced to the span, in one chunk when it
+    fits. Shared by the IMAGE node, the file node and the chain."""
+    def _close_up(crops, t0, t1):
+        m = int(crops.shape[0])
+        cv = vae.encode(pad_frames(crops, valid_length(m)))
+        cv, _ = redraw(
+            model, cv, m, (int(crops.shape[2]), int(crops.shape[1])), upscale_model,
+            _fp.CROP_OUT ** 2 / 1048576.0, denoise, lora, tile_tokens, sampler_name,
+            redraw_seed, slice_audio(audio, t0, t1), audio_vae, None, fps,
+            attention, chunk_join, chunking and not _fp.one_chunk(m), tiling,
+            redraw_start, redraw_steps)
+        out = decode_streamed(vae.decode, cv, m)
+        del cv
+        return out.float().cpu()
+    return _close_up
 
 
 def check_vae(vae):
@@ -793,6 +833,13 @@ class HTCVideoUpsamplerToFile:
             batches = (imgs[s:s + READ_FRAMES] for s in range(0, int(imgs.shape[0]), READ_FRAMES))
             how = "not a plain file (components or list): decoded whole"
             hit = None
+        if src is not None:
+            def source_batches():
+                return read_frames(video.get_stream_source(), start, duration, READ_FRAMES,
+                                   crop, src_fps, fps if to_24 else None)
+        else:
+            def source_batches():
+                return (imgs[s:s + READ_FRAMES] for s in range(0, int(imgs.shape[0]), READ_FRAMES))
         if hit is None:
             lat, n, src_size = encode_video_streamed(vae, batches)
             if key:
@@ -807,13 +854,40 @@ class HTCVideoUpsamplerToFile:
             attention, chunk_join, chunking, tiling, redraw_start, redraw_steps)
         del lat
         out_w, out_h = int(vid.shape[4]) * _tu.SPATIAL, int(vid.shape[3]) * _tu.SPATIAL
-        res = _sv.encode_stream(decode_slices(vae.decode, vid, n), n, out_w, out_h, fps,
+        slices = decode_slices(vae.decode, vid, n)
+        if float(denoise) > 0.0 and _fp.FACE_PASS:
+            # Small faces: found and cut from the source in two more reads of the
+            # file (nothing held but the crops), re-drawn as close-ups, pasted
+            # into each decoded slice on its way to the encoder.
+            sx, sy = out_w / float(src_size[0]), out_h / float(src_size[1])
+            dets = _fp.detect_batches(source_batches())
+            jobs = _fp.select(dets, n, (sx + sy) / 2.0) if dets is not None else []
+            if jobs:
+                crops = _fp.crops_from_batches(jobs, source_batches())
+                _fp.render(jobs, crops, close_up_fn(
+                    vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
+                    redraw_seed, audio, audio_vae, fps, attention, chunk_join, chunking,
+                    tiling, redraw_start, redraw_steps), fps)
+                del crops
+                slices = _paste_stream(slices, jobs, sx, sy)
+            if dets is not None:
+                report += _fp.note(jobs)
+        res = _sv.encode_stream(slices, n, out_w, out_h, fps,
                                 frame_gen, codec, quality, filename_prefix, audio,
                                 prompt, extra_pnginfo)
         _video, path, save_report = res["result"]
         report = f"{report}; {save_report}; total {time.perf_counter() - t0:.0f} s"
         print(f"[{TAG}] {report}", flush=True)
         return {"ui": res["ui"], "result": (_video, path, report)}
+
+
+def _paste_stream(slices, jobs, sx, sy):
+    """decode_slices() with the small-face close-ups blended into each slice."""
+    at = 0
+    for part in slices:
+        _fp.paste_jobs(part, at, jobs, sx, sy)
+        at += int(part.shape[0])
+        yield part
 
 
 # --- frames for IMAGE graphs ------------------------------------------------

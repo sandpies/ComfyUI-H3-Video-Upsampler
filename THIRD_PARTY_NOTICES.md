@@ -31,6 +31,14 @@ The 3-step Regenerate-2K schedule (`[0.8, 24/35, 0.48, 0]`; release `[0.909375, 
 from NVlabs' [Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
 and [Kijai/MiniMax-H3-experimental](https://huggingface.co/Kijai/MiniMax-H3-experimental).
 
+## YuNet face detector (`face_pass.py`, downloaded on first use)
+
+The small-face pass finds faces with [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
+(`face_detection_yunet_2023mar.onnx`, 232 KB) through OpenCV's `FaceDetectorYN`. The
+model is not in this repository: it is downloaded from opencv_zoo on first use into
+`ComfyUI/models/facedetection` and checked against its SHA-256. YuNet is MIT licensed,
+Copyright (c) 2020 Shiqi Yu.
+
 ## `upscale_guide.py` -- the h3upscale guide layout
 
 The guide geometry (`target_crop_v2` / `target_grid_stride_v1`: the source

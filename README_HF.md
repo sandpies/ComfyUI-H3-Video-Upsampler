@@ -39,6 +39,10 @@ detail -- the same upsampler Hand-Tie-Clips runs over a whole chain. Mouths, mot
   upscaler and the standard VAE, with the same results otherwise.
 - The H3 models: the official `minimax_h3_fl2va_pruned_int8_convrot` DiT, video and
   audio VAE.
+- **OpenCV** (`opencv-python`, in most ComfyUI installs already) for the small-face
+  re-draw. Its face detector (YuNet, 232 KB) downloads itself into
+  `ComfyUI/models/facedetection` on first use. Without OpenCV, or offline with no
+  detector file, the pass is skipped and the log says so; the rest is unchanged.
 
 **Faster VAE (optional):** `minimax_h3_sol_vae_fp16.safetensors` in the VAE loader made a
 whole run about 20% faster in tests. Colour and motion were identical; hair edges came out
@@ -190,6 +194,24 @@ help:
   general: *"2D anime, flat cel shading, clean black line art, no film grain"*,
   or *"live-action, natural skin texture, shallow depth of field"*.
 
+## Small and distant faces
+
+H3 works on a picture 32 times smaller than the frame, so a face that is far from the
+camera is only a few points wide to the re-draw. There is not enough of it left to keep
+the person, and the re-draw draws its own face: heavier brows, eyeliner, darker eyes.
+Close-ups keep their person.
+
+So every small face gets a close-up of its own, automatically. Faces are found in your
+clip and followed from frame to frame; each one under about 220 px tall in the output is
+cut out with some room around it, enlarged to close-up size, re-drawn with the same LoRA,
+settings and soundtrack, then shrunk back and blended in with a soft oval edge. Between
+220 and 360 px it fades over to the main re-draw, which holds faces that size. Up to four
+faces per clip, largest first; each costs one extra small re-draw over the frames where
+it is small. There is no setting for it: it runs whenever `denoise` is above 0.
+
+A face that turns away or is covered can lose its close-up for a few frames, and on one
+face held for more than about 14 s without a cut the close-up is re-drawn in pieces.
+
 ## Clips that aren't 24 fps
 
 H3 places every frame 1/24 s after the last and lays the soundtrack under them
@@ -225,4 +247,5 @@ Built in [ComfyUI-Hand-Tie-Clips](https://github.com/sandpies/ComfyUI-Hand-Tie-C
 whole chain. Latent upscaler network: LBH-123-AI. Upscale recipe: bbaudio-2025's
 MMH3 Ultimate Upscale. Open-H3-Regenerate-2K refiner and 3-step schedule: NVlabs
 (`Efficient-Large-Model/Open-H3-Regenerate-2K`) and Kijai. Core's H3 latent upscaler, used when present: Kijai. Guide layout and
-dataset of the retired LoRA: Alissonerdx. See `THIRD_PARTY_NOTICES.md`.
+dataset of the retired LoRA: Alissonerdx. Face detector: YuNet (Shiqi Yu, opencv_zoo).
+See `THIRD_PARTY_NOTICES.md`.
