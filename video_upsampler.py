@@ -604,9 +604,17 @@ def close_up_fn(vae, model, upscale_model, denoise, lora, tile_tokens, sampler_n
             redraw_seed, slice_audio(audio, t0, t1), audio_vae, None, fps,
             attention, chunk_join, chunking and not _fp.one_chunk(m), tiling,
             redraw_start, redraw_steps)
-        out = decode_streamed(vae.decode, cv, m)
+        # straight to 8-bit, slice by slice: as float32 a close-up spanning a whole
+        # 2-minute film is 28 GB (2946 f at 896 px)
+        out, at = None, 0
+        for part in decode_slices(vae.decode, cv, m):
+            k = int(part.shape[0])
+            if out is None:
+                out = torch.empty((m, int(part.shape[1]), int(part.shape[2]), 3), dtype=torch.uint8)
+            out[at:at + k] = (part.float().clamp(0, 1) * 255.0).round().to(torch.uint8)
+            at += k
         del cv
-        return out.float().cpu()
+        return out[:at]
     return _close_up
 
 

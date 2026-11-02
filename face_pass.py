@@ -260,7 +260,7 @@ def oval(size):
 
 
 def paste(img, redrawn, cx, cy, side, w, sx, sy, dev=None):
-    """Blend `redrawn` crops [m, S, S, 3] over `img` [m, Ho, Wo, 3] in place.
+    """Blend `redrawn` crops [m, S, S, 3] (float 0..1, or uint8) over `img` [m, Ho, Wo, 3] in place.
     Crop centres/sides are in source px; sx, sy = output px per source px;
     w = per-frame weight. The crop's tone is matched to `img` on the oval's rim."""
     dev = dev or img.device
@@ -289,7 +289,10 @@ def paste(img, redrawn, cx, cy, side, w, sx, sy, dev=None):
         v = (torch.arange(y0, y1, dtype=torch.float32, device=dev) + 0.5 - ccy) / hy
         grid = torch.stack(torch.broadcast_tensors(u[None, :], v[:, None]), dim=-1)[None]
         tw, th = max(1, x1 - x0), max(1, y1 - y0)
-        c = redrawn[t:t + 1].to(dev, torch.float32).permute(0, 3, 1, 2)
+        c = redrawn[t:t + 1].to(dev, torch.float32)
+        if redrawn.dtype == torch.uint8:   # 8-bit crops: one frame to float at a time
+            c = c / 255.0
+        c = c.permute(0, 3, 1, 2)
         side_px = max(2, int(round(2 * max(hx, hy))))
         if side_px < c.shape[-1]:
             c = F.interpolate(c, size=(side_px, side_px), mode="bilinear", antialias=True,
@@ -375,7 +378,16 @@ def render(jobs, crops, redraw_fn, fps):
     for i, (j, c) in enumerate(zip(jobs, crops)):
         t0 = j["f0"] / float(fps)
         out = redraw_fn(c.float() / 255.0, t0, t0 + j["m"] / float(fps))[: j["m"]]
-        j["out"] = (out.float().clamp(0, 1) * 255.0).round().to(torch.uint8)
+        # In slices: a close-up that spans a whole long film is tens of GB as floats, and
+        # converting it in one go allocated a second full copy (2946 f at 896 px: 28 GB, OOM).
+        if out.dtype == torch.uint8:     # the upsampler's close-up is already 8-bit
+            q = out
+        else:
+            q = torch.empty(tuple(out.shape), dtype=torch.uint8)
+            for s in range(0, int(out.shape[0]), 64):
+                q[s:s + 64] = (out[s:s + 64].float().clamp(0, 1) * 255.0).round().to(torch.uint8)
+        del out
+        j["out"] = q
         print(f"[{TAG}] small face {i + 1}: frames {j['f0']}-{j['f0'] + j['m'] - 1}, "
               f"{j['size_out']:.0f} px tall in the output, re-drawn as a "
               f"{int(j['out'].shape[1])} px close-up", flush=True)
@@ -391,7 +403,8 @@ def paste_jobs(img, f_off, jobs, sx, sy):
         if a >= b:
             continue
         i0, i1 = a - j["f0"], b - j["f0"]
-        paste(img[a - f_off:b - f_off], j["out"][i0:i1].float() / 255.0, j["cx"][i0:i1],
+        # the 8-bit close-up goes in as is: as floats a whole-film close-up is 28 GB
+        paste(img[a - f_off:b - f_off], j["out"][i0:i1], j["cx"][i0:i1],
               j["cy"][i0:i1], j["side"][i0:i1], j["w"][i0:i1], sx, sy)
     return img
 
@@ -405,7 +418,7 @@ def apply(img, images, redraw_fn, fps=24.0):
     """Re-draw the small faces of `images` (the source, [n, h, w, 3]) as close-ups
     and blend them into `img` (the upsampled clip, [n, Ho, Wo, 3]) in place.
 
-    redraw_fn(crops [m, CROP_IN, CROP_IN, 3], t0_s, t1_s) -> [m, S, S, 3]: the
+    redraw_fn(crops [m, CROP_IN, CROP_IN, 3], t0_s, t1_s) -> [m, S, S, 3] (float 0..1 or uint8): the
     upsampler run on the crop clip with the soundtrack from t0_s to t1_s, in ONE
     chunk when it fits (see one_chunk): a chunk seam inside a close-up morphs the face.
     -> (img, note)"""
