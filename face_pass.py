@@ -37,7 +37,10 @@ YUNET_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
 
 FACE_PASS = True        # False = upsampler output untouched
 FACE_FULL_PX = 220      # output face height (px) at or below which the close-up re-draw is used fully
-FACE_OFF_PX = 360       # ... and at or above which the big re-draw is kept
+FACE_OFF_PX = 280       # ... and at or above which the big re-draw is kept (was 360 in 0.6.0:
+#                         the close-up draws a face ~CROP_OUT / CONTEXT = 358 px, so a 300 px
+#                         face gained ~1.2x detail and came out softer than the main re-draw,
+#                         issue #3 follow-up; at 280 the close-up still has >= 1.3x)
 CONTEXT = 2.5           # crop side = CONTEXT x face height
 CROP_IN = 448           # crop edge fed to the upsampler (px)
 CROP_OUT = 896          # crop edge the upsampler draws (face ~ CROP_OUT / CONTEXT px tall)

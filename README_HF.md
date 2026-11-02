@@ -205,7 +205,7 @@ So every small face gets a close-up of its own, automatically. Faces are found i
 clip and followed from frame to frame; each one under about 220 px tall in the output is
 cut out with some room around it, enlarged to close-up size, re-drawn with the same LoRA,
 settings and soundtrack, then shrunk back and blended in with a soft oval edge. Between
-220 and 360 px it fades over to the main re-draw, which holds faces that size. Up to four
+220 and 280 px it fades over to the main re-draw; faces from 280 px up are left exactly as the main re-draw drew them (that size it holds on its own, and a close-up would only soften it). Up to four
 faces per clip, largest first; each costs one extra small re-draw over the frames where
 it is small. There is no setting for it: it runs whenever `denoise` is above 0.
 
