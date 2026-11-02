@@ -280,13 +280,13 @@ def paste(img, redrawn, cx, cy, side, w, sx, sy, dev=None):
             rims.append(None)
             continue
         rims.append((x0, x1, y0, y1, float(ccx), float(ccy), float(half_x), float(half_y)))
-    # Tone offset per frame from the rim, smoothed over time.
+    # Tone offset per frame from the rim, smoothed over time. Two passes over the frames,
+    # each piece built when it is needed: kept for every frame of a long track, the float
+    # pieces were ~20 GB on a 2-minute film (review 11-02). Same pixels either way.
     offs = torch.zeros((m, 3), dtype=torch.float64)
     have = torch.zeros(m, dtype=torch.bool)
-    pieces = [None] * m
-    for t, rim in enumerate(rims):
-        if rim is None:
-            continue
+
+    def _piece(t, rim):
         x0, x1, y0, y1, ccx, ccy, hx, hy = rim
         u = (torch.arange(x0, x1, dtype=torch.float32, device=dev) + 0.5 - ccx) / hx
         v = (torch.arange(y0, y1, dtype=torch.float32, device=dev) + 0.5 - ccy) / hy
@@ -305,11 +305,18 @@ def paste(img, redrawn, cx, cy, side, w, sx, sy, dev=None):
         r = torch.sqrt(u[None, :] ** 2 + (v[:, None] * 0.92) ** 2)
         a = 1.0 - _smoothstep(MASK_IN, MASK_OUT, r)
         ring = (r > MASK_IN) & (r < MASK_OUT)
+        return piece, a, ring
+
+    for t, rim in enumerate(rims):
+        if rim is None:
+            continue
+        x0, x1, y0, y1 = rim[:4]
+        piece, _a, ring = _piece(t, rim)
         base = img[t, y0:y1, x0:x1].to(dev, torch.float32)
         if int(ring.sum()) > 16:
             offs[t] = (base[ring].mean(0) - piece[ring].mean(0)).double().cpu()
             have[t] = True
-        pieces[t] = (piece, a)
+        del piece, _a, ring, base
     if bool(have.any()):
         idx = torch.nonzero(have).view(-1).double()
         full = torch.arange(m, dtype=torch.float64)
@@ -318,10 +325,10 @@ def paste(img, redrawn, cx, cy, side, w, sx, sy, dev=None):
             offs[:, ch] = (_gauss(_interp(full, idx, v), 3.0) if v.numel() > 1
                            else v.expand(m).clone())
     for t, rim in enumerate(rims):
-        if pieces[t] is None:
+        if rim is None:
             continue
         x0, x1, y0, y1 = rim[:4]
-        piece, a = pieces[t]
+        piece, a, _ring = _piece(t, rim)
         piece = (piece + offs[t].to(dev, torch.float32)).clamp(0, 1)
         a = (a * float(w[t]))[..., None]
         base = img[t, y0:y1, x0:x1].to(dev, torch.float32)
@@ -380,7 +387,7 @@ def render(jobs, crops, redraw_fn, fps):
     """Run the close-up re-draw for every job; stores job["out"] ([m, S, S, 3] uint8)."""
     for i, (j, c) in enumerate(zip(jobs, crops)):
         t0 = j["f0"] / float(fps)
-        out = redraw_fn(c.float() / 255.0, t0, t0 + j["m"] / float(fps))[: j["m"]]
+        out = redraw_fn(c.float().div_(255.0), t0, t0 + j["m"] / float(fps))[: j["m"]]
         # In slices: a close-up that spans a whole long film is tens of GB as floats, and
         # converting it in one go allocated a second full copy (2946 f at 896 px: 28 GB, OOM).
         if out.dtype == torch.uint8:     # the upsampler's close-up is already 8-bit

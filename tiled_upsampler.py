@@ -2470,9 +2470,9 @@ class HTCUpsampleSettings:
                                "and in side-by-side tests looked the same."}),
                 "start_sigma": ("FLOAT", {
                     "default": d["start_sigma"], "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Leave at 0 (= Regen2K; use redraw_start instead). Above 0 the "
-                               "re-draw follows the model's own schedule from this point, for "
-                               "the pre-Regen2K recipe."}),
+                    "tooltip": ("Leave at 0 (the Regen2K recipe; redraw_start sets how much "
+                                "changes). Above 0: the older recipe, re-drawing from this noise "
+                                "level.")}),
                 "noise": (["per_chunk", "film"], {
                     "default": "per_chunk",
                     "tooltip": "per_chunk = each piece gets its own noise (Regen2K default). "

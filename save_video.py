@@ -207,7 +207,10 @@ class HTCSaveVideo:
                 "quality": (list(QUALITY), {"default": "max", "tooltip": (
                     "Constant quality, not a bitrate. max shows no loss on H3 output; "
                     "archive is near-lossless and large; high is for sharing.")}),
-                "filename_prefix": ("STRING", {"default": "video/H3_upsampled"}),
+                "filename_prefix": ("STRING", {"default": "video/H3_upsampled",
+                    "tooltip": ("Start of the file name in ComfyUI's output folder. A folder "
+                                "works too: video/mine.")
+                }),
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "The soundtrack. Trimmed or padded to the picture."}),

@@ -768,7 +768,10 @@ class HTCVideoUpsamplerToFile:
                 "File quality. Lower = smaller file.")})
         except Exception:  # noqa: BLE001 -- PyAV missing: the node fails at run time
             pass
-        req["filename_prefix"] = ("STRING", {"default": "video/H3_upsampled"})
+        req["filename_prefix"] = ("STRING", {
+            "default": "video/H3_upsampled",
+            "tooltip": "Start of the file name in ComfyUI's output folder. A folder works too: "
+                       "video/mine."})
         req["frame_rate"] = (list(FRAME_RATES), {"default": FRAME_RATES[0], "tooltip": (
             "source = keep every frame. 24 = convert to H3's own 24 fps while reading: "
             "lip sync is exact and a 48 fps clip is half the work. Use frame_gen x2 to "
