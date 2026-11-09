@@ -47,6 +47,7 @@ import torch
 
 from . import face_pass as _fp
 from . import tiled_upsampler as _tu
+from . import upsample_ic as _ic
 from . import upscale_guide as _ug
 
 TAG = "H3VideoUpsampler"
@@ -526,8 +527,14 @@ class HTCVideoUpsampler:
                     "default": REDRAW_STEPS[0],
                     "tooltip": ("Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster; "
                                 "in side-by-side tests it looked the same.")}),
+                # appended last: widgets_values are positional
+                "method": (list(_ic.METHODS), {
+                    "default": _ic.METHODS[0], "tooltip": _ic.METHOD_TIP}),
             },
             "optional": {
+                "clip": ("CLIP", {"tooltip": (
+                    "The H3 text encoder (CLIPLoader, type minimax). Only method ic uses it: "
+                    "it is shown each piece of the clip.")}),
                 "conditioning": ("CONDITIONING", {"tooltip": (
                     "Optional: a text prompt (CLIPTextEncode with the H3 text encoder) "
                     "describing the clip. Describe the look (\"2D anime, flat cel shading, "
@@ -559,8 +566,8 @@ class HTCVideoUpsampler:
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
             attention="sparse", chunk_join="stepped", chunking=True, tiling=True,
-            redraw_start=0.6, redraw_steps=REDRAW_STEPS[0], audio=None,
-            audio_vae=None, conditioning=None, fps=None):
+            redraw_start=0.6, redraw_steps=REDRAW_STEPS[0], method=_ic.METHODS[0],
+            audio=None, audio_vae=None, conditioning=None, fps=None, clip=None):
         check_vae(vae)
         n = int(images.shape[0])
         if n < 1:
@@ -574,15 +581,18 @@ class HTCVideoUpsampler:
         vid, report = redraw(
             model, video, n, (src_w, src_h), upscale_model, megapixels, denoise, lora,
             tile_tokens, sampler_name, redraw_seed, audio, audio_vae, conditioning, fps,
-            attention, chunk_join, chunking, tiling, redraw_start, redraw_steps)
+            attention, chunk_join, chunking, tiling, redraw_start, redraw_steps,
+            method=method, clip=clip, vae=vae)
         img = decode_streamed(vae.decode, vid, n)
         del vid
-        if float(denoise) > 0.0:
+        # IC keeps faces from the draft: the small-face close-ups are Regen2K's fix
+        if float(denoise) > 0.0 and not _ic.is_ic(method):
             img = img.float().cpu()
             img, note = _fp.apply(img, images, close_up_fn(
                 vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
                 redraw_seed, audio, audio_vae, fps, attention, chunk_join, chunking, tiling,
-                redraw_start, redraw_steps), float(fps) if fps else float(H3_FPS))
+                redraw_start, redraw_steps, method=method, clip=clip),
+                float(fps) if fps else float(H3_FPS))
             report += note
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
                 report)
@@ -590,7 +600,8 @@ class HTCVideoUpsampler:
 
 def close_up_fn(vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
                 redraw_seed, audio, audio_vae, fps, attention="sparse", chunk_join="stepped",
-                chunking=True, tiling=True, redraw_start=0.6, redraw_steps=REDRAW_STEPS[0]):
+                chunking=True, tiling=True, redraw_start=0.6, redraw_steps=REDRAW_STEPS[0],
+                method=_ic.METHODS[0], clip=None):
     """The small-face close-up re-draw (face_pass) for a clip upsampled with these
     settings: crops [m, S, S, 3] + their time span -> the same upsampler at
     face_pass.CROP_OUT, the soundtrack sliced to the span, in one chunk when it
@@ -603,7 +614,7 @@ def close_up_fn(vae, model, upscale_model, denoise, lora, tile_tokens, sampler_n
             _fp.CROP_OUT ** 2 / 1048576.0, denoise, lora, tile_tokens, sampler_name,
             redraw_seed, slice_audio(audio, t0, t1), audio_vae, None, fps,
             attention, chunk_join, chunking and not _fp.one_chunk(m), tiling,
-            redraw_start, redraw_steps)
+            redraw_start, redraw_steps, method=method, clip=clip, vae=vae)
         # straight to 8-bit, slice by slice: as float32 a close-up spanning a whole
         # 2-minute film is 28 GB (2946 f at 896 px)
         out, at = None, 0
@@ -633,9 +644,13 @@ def check_vae(vae):
 def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
            tile_tokens, sampler_name, redraw_seed, audio, audio_vae, conditioning, fps,
            attention="sparse", chunk_join="stepped", chunking=True, tiling=True,
-           redraw_start=0.6, redraw_steps=REDRAW_STEPS[0]):
+           redraw_start=0.6, redraw_steps=REDRAW_STEPS[0], method=_ic.METHODS[0],
+           clip=None, vae=None):
     """Steps 2-4 for a clip already encoded: `video` is the H3 video latent of
-    `n` frames padded to `valid_length(n)`. -> (upsampled video latent, report)."""
+    `n` frames padded to `valid_length(n)`. -> (upsampled video latent, report).
+
+    `method` ic re-draws in context (upsample_ic): needs `clip` (the H3 text
+    encoder) and `vae` (to show Qwen each chunk's draft)."""
     import comfy.nested_tensor as nt
     import comfy.samplers
     import folder_paths
@@ -681,6 +696,11 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
     else:
         cond = zero_out_cond()
         cond_note = "zeroed-out conditioning"
+    if _ic.is_ic(method) and float(denoise) > 0.0:
+        return _redraw_ic(model, video, latent, n, src_size, length, latent_t, audio_t,
+                          upscale_model, megapixels, tile_tokens, redraw_seed, audio_vae,
+                          attention, chunk_join, chunking, tiling, clip, vae, lora,
+                          sound=audio_note)
     model = model.clone() if hasattr(model, "clone") else model
     eff_lora = str(lora or "").strip()
     if not eff_lora or eff_lora == "None":
@@ -691,6 +711,12 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
     elif eff_lora is None:
         lora_tag = f"pre-patched ({len(model.patches)} targets)"
     else:
+        if _ic.is_ic_lora(eff_lora):
+            # one lora widget serves both methods: an IC file left there after
+            # switching to regen2k means Regen2K's own LoRA
+            print(f"[{TAG}] regen2k: lora {eff_lora} is an IC LoRA (method ic only); "
+                  f"using {REGEN2K_DEFAULT_LORA}", flush=True)
+            eff_lora = REGEN2K_DEFAULT_LORA
         folder_paths.get_full_path_or_raise("loras", eff_lora)
         model = nodes.LoraLoaderModelOnly().load_lora_model_only(
             model, eff_lora, eff_strength)[0]
@@ -744,6 +770,65 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
     return vid, report
 
 
+def _redraw_ic(model, video, latent, n, src_size, length, latent_t, audio_t, upscale_model,
+               megapixels, tile_tokens, redraw_seed, audio_vae, attention, chunk_join,
+               chunking, tiling, clip, vae, lora=None, sound=None):
+    """redraw() for method ic: the same upsample, with the IC-patched model, IC
+    sigmas, the clip's soundtrack in the audio rows (encoded silence when there
+    is none) and per-chunk in-context conditioning."""
+    import comfy.nested_tensor as nt
+    import comfy.samplers
+
+    if vae is None:
+        raise RuntimeError(f"{TAG}: method ic needs the video VAE")
+    conds = _ic.ChunkConds(clip, decode=vae.decode, encode=vae.encode)
+    if getattr(model, "patches", None):
+        print(f"[{TAG}] ic: the wired model already carries {len(model.patches)} patched "
+              "weights (LoRAs?); IC was trained on the plain official ref2va model.", flush=True)
+    model, sigmas, lora_tag = _ic.patch_model(model, lora)
+    if sound is not None and sound.startswith("conditioned on the soundtrack"):
+        # keep the clip's own audio rows that redraw() encoded: mouths shape to it
+        audio_note = "the clip's soundtrack" + sound[len("conditioned on the soundtrack"):]
+    else:
+        print(f"[{TAG}] ic: no soundtrack to hear ({sound}); audio rows = encoded "
+              "silence (mouths then follow the draft only)", flush=True)
+        a_lat, audio_note = _ic.silent_audio_latent(audio_vae, length, audio_t, video.dtype,
+                                                    video.device)
+        latent = {"samples": nt.NestedTensor((video, a_lat))}
+    sampler = comfy.samplers.sampler_object("euler")
+    w, h = int(video.shape[4]) * _tu.SPATIAL, int(video.shape[3]) * _tu.SPATIAL
+    sig_list = [round(float(s), 4) for s in sigmas]
+    print(f"[{TAG}] {n} frames at {src_size[0]}x{src_size[1]} -> H3 canvas {w}x{h}, "
+          f"{length} frames ({latent_t} latent steps), audio rows {audio_note}; "
+          f"{lora_tag}, euler, sigmas {sig_list}", flush=True)
+    overlap_px = int(_tu.CHAIN_DEFAULTS["tile_overlap_px"])
+    out = _tu.upsample(model, zero_out_cond(), latent, sampler, str(upscale_model),
+                       float(megapixels), 1.0, guide=None, budget=int(tile_tokens),
+                       steps=len(sigmas) - 1, start_sigma=0.0, overlap_px=overlap_px,
+                       detail_sigma=0.0, chunk_frames=int(_ic.CHUNK_FRAMES),
+                       seed=int(redraw_seed), noise="per_chunk", sigmas=sigmas,
+                       attention=attention, chunk_join=chunk_join, chunking=chunking,
+                       tiling=tiling, ic=conds)
+    _ic.release()          # ~5.5 GB of mapped LoRA weights: never held between runs
+    misses = _ic.embedder_misses(model)
+    if misses:
+        print(f"[{TAG}] ic: WARNING HyperFlow's endpoint missed the generated rows on "
+              f"{misses} calls", flush=True)
+    _tu._free(model)
+    if _tu._device().type == "cuda":
+        _tu._free_all_gpu()
+    vid = out["samples"].tensors[0]
+    del out
+    report = (f"{n} frames {src_size[0]}x{src_size[1]} -> "
+              f"{int(vid.shape[4]) * _tu.SPATIAL}x{int(vid.shape[3]) * _tu.SPATIAL}"
+              f", {lora_tag}, {len(sigmas) - 1} steps from {float(sigmas[0]):.3f}"
+              f", audio rows {audio_note}, attention {attention}, chunk_join {chunk_join}"
+              f", chunking {'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}"
+              f" (tiles see their own window of the draft)")
+    print(f"[{TAG}] {report}", flush=True)
+    return vid, report
+
+
 
 class HTCVideoUpsamplerToFile:
     """The upsampler from a video file to an MP4, never holding the film's frames."""
@@ -755,7 +840,7 @@ class HTCVideoUpsamplerToFile:
             "The clip (Load Video or Load Video (path)). It's read a piece at a time, so "
             "any length works; frame rate and sound come from the file.")})}
         for k, v in base["required"].items():
-            if k != "images":
+            if k not in ("images", "method"):
                 req[k] = v
         try:
             from .save_video import CPU_CODECS, FRAME_GEN, QUALITY
@@ -780,8 +865,9 @@ class HTCVideoUpsamplerToFile:
             "Remember the prepared clip (about 100 MB a minute, in ComfyUI's temp "
             "folder), so re-running the same clip with other settings starts faster. "
             "Cleared when ComfyUI restarts.")})
+        req["method"] = base["required"]["method"]      # appended last: positional
         opt = {k: v for k, v in base["optional"].items()
-               if k in ("audio_vae", "conditioning")}
+               if k in ("audio_vae", "conditioning", "clip")}
         return {"required": req, "optional": opt,
                 "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
@@ -800,8 +886,8 @@ class HTCVideoUpsamplerToFile:
             chunk_join="stepped", chunking=True, tiling=True, redraw_start=0.6,
             redraw_steps=REDRAW_STEPS[0], frame_gen="off",
             codec="auto", quality="max", filename_prefix="video/H3_upsampled",
-            frame_rate=FRAME_RATES[0], reuse_encoded=True,
-            audio_vae=None, conditioning=None, prompt=None, extra_pnginfo=None):
+            frame_rate=FRAME_RATES[0], reuse_encoded=True, method=_ic.METHODS[0],
+            audio_vae=None, conditioning=None, clip=None, prompt=None, extra_pnginfo=None):
         import hashlib
         import json
         import time
@@ -862,11 +948,13 @@ class HTCVideoUpsamplerToFile:
         vid, report = redraw(
             model, lat, n, src_size, upscale_model, megapixels, denoise, lora,
             tile_tokens, sampler_name, redraw_seed, audio, audio_vae, conditioning, fps,
-            attention, chunk_join, chunking, tiling, redraw_start, redraw_steps)
+            attention, chunk_join, chunking, tiling, redraw_start, redraw_steps,
+            method=method, clip=clip, vae=vae)
         del lat
         out_w, out_h = int(vid.shape[4]) * _tu.SPATIAL, int(vid.shape[3]) * _tu.SPATIAL
         slices = decode_slices(vae.decode, vid, n)
-        if float(denoise) > 0.0 and _fp.FACE_PASS:
+        # IC keeps faces from the draft: the small-face close-ups are Regen2K's fix
+        if float(denoise) > 0.0 and _fp.FACE_PASS and not _ic.is_ic(method):
             # Small faces: found and cut from the source in two more reads of the
             # file (nothing held but the crops), re-drawn as close-ups, pasted
             # into each decoded slice on its way to the encoder.
@@ -878,7 +966,7 @@ class HTCVideoUpsamplerToFile:
                 _fp.render(jobs, crops, close_up_fn(
                     vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
                     redraw_seed, audio, audio_vae, fps, attention, chunk_join, chunking,
-                    tiling, redraw_start, redraw_steps), fps)
+                    tiling, redraw_start, redraw_steps, method=method, clip=clip), fps)
                 del crops
                 slices = _paste_stream(slices, jobs, sx, sy)
             if dets is not None:

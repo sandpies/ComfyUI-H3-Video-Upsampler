@@ -27,7 +27,12 @@ detail -- the same upsampler Hand-Tie-Clips runs over a whole chain. Mouths, mot
    ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler))
    and the Regen2K LoRA [`open_h3_regenerate_2k_r256pp_bf16.safetensors`](https://huggingface.co/sandpies/ComfyUI-H3-Video-Upsampler/blob/main/lora/open_h3_regenerate_2k_r256pp_bf16.safetensors)
    (3.77 GB, from this pack's Hugging Face `lora/`) in `ComfyUI/models/loras`.
-3. Load `example_workflows/H3_Video_Upsampler_File.json` (recommended: any length, flat RAM) or `example_workflows/H3_Video_Upsampler.json` (IMAGE in, IMAGE out), pick a clip, queue.
+3. Optional, for `method = ic`: Kijai's IC LoRA
+   [`minimax_h3_open_regenerate_2k_ic_lora_avg_rank_21_bf16.safetensors`](https://huggingface.co/Kijai/MiniMax-H3-experimental/blob/main/loras/minimax_h3_open_regenerate_2k_ic_lora_avg_rank_21_bf16.safetensors)
+   (200 MB) and the HyperFlow 8-step weights `minimax_h3_hyperflow_8step_v1.0.safetensors`
+   ([videorebirth/hyperflow](https://huggingface.co/videorebirth/hyperflow)) in
+   `ComfyUI/models/loras`. See *method ic* below.
+4. Load `example_workflows/H3_Video_Upsampler_File.json` (recommended: any length, flat RAM) or `example_workflows/H3_Video_Upsampler.json` (IMAGE in, IMAGE out), pick a clip, queue.
 
 ## Requirements
 
@@ -71,9 +76,32 @@ ComfyUI uses the bundled copy, chunk by chunk, with the same checkpoint.
 | `redraw_steps` | **3 (recipe)** or **2**: a third faster, and looked the same in side-by-side tests |
 | `fps` (optional input) | The clip's frame rate (from Video Frames). Needed for lip sync when the clip isn't 24 fps: what the re-draw hears is retimed to match. The output soundtrack is always the original |
 | `conditioning` (optional input) | A text prompt (CLIPTextEncode, H3 text encoder) describing the clip. Unwired works well for most clips. See *Guiding the re-draw* |
+| `method` | **`regen2k` (default)** or **`ic`**: see *method ic* below |
+| `clip` (optional input) | The H3 text encoder (CLIPLoader, type `minimax`). Only `method = ic` uses it |
 
 The recipe: 102-frame chunks sharing 17, 70000-token tiles with 128 px overlap,
 fresh noise per chunk, the soundtrack pinned clean.
+
+### method ic
+
+`regen2k` re-draws detail from the enlarged clip and never sees your clip again,
+so faces, lettering and mouths can drift into someone slightly different. `ic`
+(in-context, after NVlabs' Open-H3-Regenerate-2K-IC) keeps each ~5 s piece's own
+original frames in view while it re-draws, and hears its soundtrack: in
+side-by-side tests the people stayed the same people, text kept its strokes and
+mouths followed the speech.
+
+- Needs: the `clip` input (H3 text encoder), `audio_vae` (for the soundtrack), a
+  **plain ref2va DiT** (`minimax_h3_ref2va_*`, no LoRAs) as `model`, and the two
+  files from *Install* step 3.
+- Costs more time: about 1.7x Regen2K in our tests (2 MP on an RTX 5090: ~25 s of
+  compute per second of video). VRAM stays one piece's worth however long the clip.
+- Uses 119-frame pieces, euler and its own 3-step schedule; `lora` may name the IC
+  file, `redraw_start` / `redraw_steps` are ignored. Tiling works: each tile sees
+  its own window of the original frames (no visible seam in our tests). The
+  small-face pass is skipped: IC keeps faces from your clip.
+- The text encoder loads once per run, before the DiT. On 32 GB of RAM expect it
+  and the DiT to be reloaded from disk; 64 GB holds both.
 
 - Wire a **plain** diffusion model loader as `model` (no LoRAs): LoRAs under the
   re-draw add their own texture.

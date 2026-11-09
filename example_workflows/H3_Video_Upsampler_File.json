@@ -248,7 +248,8 @@
     "max",
     "video/H3_upsampled",
     "source",
-    true
+    true,
+    "regen2k"
    ]
   },
   {

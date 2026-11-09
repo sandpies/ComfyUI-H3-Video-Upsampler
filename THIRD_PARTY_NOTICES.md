@@ -31,6 +31,17 @@ The 3-step Regenerate-2K schedule (`[0.8, 24/35, 0.48, 0]`; release `[0.909375, 
 from NVlabs' [Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
 and [Kijai/MiniMax-H3-experimental](https://huggingface.co/Kijai/MiniMax-H3-experimental).
 
+## Open-H3-Regenerate-2K-IC (`method=ic`, `upsample_ic.py`)
+
+The in-context re-draw follows NVlabs' Open-H3-Regenerate-2K-IC (sol-engine
+`models/Open-H3-Regenerate-2K/IC`): the draft as `<Video 1>`, the fixed task
+sentence, HyperFlow 8-step + LMS Sharp under the IC LoRA, and its 3-step schedule
+from HyperFlow's grid. Our own code on ComfyUI core; nothing was copied. The IC
+LoRA file this pack points to is Kijai's rank-21 resize
+([Kijai/MiniMax-H3-experimental](https://huggingface.co/Kijai/MiniMax-H3-experimental));
+HyperFlow is [videorebirth/hyperflow](https://huggingface.co/videorebirth/hyperflow).
+Neither is redistributed here.
+
 ## YuNet face detector (`face_pass.py`, downloaded on first use)
 
 The small-face pass finds faces with [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
