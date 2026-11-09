@@ -305,6 +305,14 @@ def lora_paths(wanted=None):
             folder_paths.get_full_path_or_raise("loras", HYPERFLOW_LORA), sharp)
 
 
+def preflight(clip, lora=None, needs_clip=True):
+    """Fail before any work: the clip input and the files method ic needs."""
+    if needs_clip and clip is None:
+        raise RuntimeError(f"{TAG}: method ic needs the clip input wired (CLIPLoader with the "
+                           "H3 text encoder, type minimax). Nothing was run.")
+    lora_paths(lora)
+
+
 def _is_diffusers(path):
     from safetensors import safe_open
     with safe_open(path, framework="pt", device="cpu") as f:
