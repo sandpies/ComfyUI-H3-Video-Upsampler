@@ -57,8 +57,8 @@ METHODS = ("regen2k", "ic")
 METHOD_TIP = ("regen2k = the Regen2K LoRA re-draws detail from the enlarged clip (faster). "
               "ic = in-context: each piece's original frames stay in view while it is "
               "re-drawn and it hears the soundtrack, so faces, text and mouths stay the "
-              "clip's own (slower). ic needs the clip input wired (the H3 text encoder), "
-              "audio_vae for the soundtrack, and in models/loras an IC LoRA "
+              "clip's own (slower). ic needs audio_vae for the soundtrack and, in "
+              "models/loras, an IC LoRA "
               f"({IC_LORA_SMALL}, 200 MB) + {HYPERFLOW_LORA} (+ {SHARP_LORA}). Under ic, lora "
               "picks the IC file when it names one; redraw_start and redraw_steps are ignored. "
               "Tiles only when a piece is too big for the GPU; each tile then sees its own "
@@ -307,9 +307,10 @@ def lora_paths(wanted=None):
 
 def preflight(clip, lora=None, needs_clip=True):
     """Fail before any work: the clip input and the files method ic needs."""
-    if needs_clip and clip is None:
+    if needs_clip and clip is None and load_task_cond() is None:
         raise RuntimeError(f"{TAG}: method ic needs the clip input wired (CLIPLoader with the "
-                           "H3 text encoder, type minimax). Nothing was run.")
+                           f"H3 text encoder, type minimax), or {TASK_COND_FILE} beside "
+                           "upsample_ic.py. Nothing was run.")
     lora_paths(lora)
 
 
@@ -395,20 +396,71 @@ def embedder_misses(model):
 
 # --- per-chunk conditioning --------------------------------------------------
 
+TASK_COND_FILE = "upsample_ic_task.safetensors"   # beside this module
+
+
+def task_cond_path():
+    import os
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), TASK_COND_FILE)
+
+
+def save_task_cond(cond, path=None):
+    """The text-only encoding of the task prompt -> a small file, so ic runs
+    without the text encoder (and its ~26 GB in RAM)."""
+    from safetensors.torch import save_file
+    (emb, d), = cond
+    tensors, meta = {"emb": emb.detach().float().cpu().contiguous()}, {}
+    for k, v in d.items():
+        if isinstance(v, torch.Tensor):
+            tensors["d." + k] = v.detach().cpu().contiguous()
+        else:
+            meta[k] = json.dumps(v)
+    meta["prompt"] = TASK + "\n\nScene description: "
+    save_file(tensors, path or task_cond_path(), metadata=meta)
+
+
+def load_task_cond(path=None):
+    """-> the cached task conditioning, or None when the file is missing."""
+    import os
+    path = path or task_cond_path()
+    if not os.path.exists(path):
+        return None
+    from safetensors import safe_open
+    d = {}
+    with safe_open(path, framework="pt", device="cpu") as f:
+        meta = dict(f.metadata() or {})
+        emb = f.get_tensor("emb")
+        for k in f.keys():
+            if k.startswith("d."):
+                d[k[2:]] = f.get_tensor(k)
+    meta.pop("prompt", None)
+    for k, v in meta.items():
+        d[k] = json.loads(v)
+    return [[emb, d]]
+
+
 class ChunkConds:
     """Builds each chunk's IC conditioning from its low-res draft latent, before
-    the DiT is staged: Qwen3-VL is shown the chunk's draft at 2 fps, and the
-    draft latent rides in minimax_refs as <Video 1>."""
+    the DiT is staged. The draft latent always rides in minimax_refs as
+    <Video 1>. With `clip` wired, Qwen3-VL is also shown the chunk's draft at
+    2 fps (NVlabs' recipe); without it, the task prompt's cached text-only
+    encoding (TASK_COND_FILE) is used and no text encoder loads at all."""
 
     def __init__(self, clip, decode, encode=None, caption=""):
+        self.cached = None
         if clip is None:
-            raise RuntimeError(f"{TAG}: method ic needs the clip input wired "
-                               "(CLIPLoader with the H3 text encoder, type minimax).")
+            self.cached = load_task_cond()
+            if self.cached is None:
+                raise RuntimeError(f"{TAG}: method ic needs the clip input wired "
+                                   "(CLIPLoader with the H3 text encoder, type minimax), or "
+                                   f"{TASK_COND_FILE} beside upsample_ic.py.")
         self.clip = clip
         self.decode = decode
         self.encode = encode
         self.prompt = TASK + "\n\nScene description: " + (caption or "")
         self.resized = 0
+        self.note = ("the text encoder sees each piece" if clip is not None
+                     else "cached task text, no text encoder")
 
     def build(self, raw):
         """raw [1, 24, T, h, w] draft latent (starting on a key step) -> conditioning."""
@@ -418,12 +470,15 @@ class ChunkConds:
 
         t = int(raw.shape[2])
         n = _tu.frames_in(t)
-        px = self.decode(raw)
-        px = px.reshape(-1, px.shape[-3], px.shape[-2], px.shape[-1])[:n, ..., :3]
-        hh, ww = int(px.shape[1]), int(px.shape[2])
+        hh, ww = int(raw.shape[3]) * _tu.SPATIAL, int(raw.shape[4]) * _tu.SPATIAL
         cw, ch = adapt_canvas(ww, hh)
         lat = raw
-        if ww * hh > cw * ch:
+        big = ww * hh > cw * ch
+        px = None
+        if self.clip is not None or big:
+            px = self.decode(raw)
+            px = px.reshape(-1, px.shape[-3], px.shape[-2], px.shape[-1])[:n, ..., :3]
+        if big:
             # bigger than H3's reference canvas: as core shows a reference video,
             # shrunk to the canvas (and encoded there)
             px = _resize(px, cw, ch, "disabled")
@@ -432,11 +487,14 @@ class ChunkConds:
                                    "no encoder was given")
             lat = _tu.encode_steps(self.encode, px, t)
             self.resized += 1
-        idx = list(range(0, n, QWEN_EVERY))
-        items = [{"type": "video", "data": px[idx].float().cpu(),
-                  "timestamps": [i / 2.0 for i in range(len(idx))]}]
-        tokens = self.clip.tokenize(self.prompt, minimax_ref_items=items)
-        cond = self.clip.encode_from_tokens_scheduled(tokens)
+        if self.clip is not None:
+            idx = list(range(0, n, QWEN_EVERY))
+            items = [{"type": "video", "data": px[idx].float().cpu(),
+                      "timestamps": [i / 2.0 for i in range(len(idx))]}]
+            tokens = self.clip.tokenize(self.prompt, minimax_ref_items=items)
+            cond = self.clip.encode_from_tokens_scheduled(tokens)
+        else:
+            cond = [[e, dict(d)] for e, d in self.cached]
         lat = lat.detach().cpu()
         blk = {"kind": "video", "latent_t": int(lat.shape[2]), "latent_h": int(lat.shape[3]),
                "latent_w": int(lat.shape[4]), "ref_audio_t": 0, "latent": lat,

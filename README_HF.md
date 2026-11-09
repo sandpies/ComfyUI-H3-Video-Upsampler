@@ -77,7 +77,7 @@ ComfyUI uses the bundled copy, chunk by chunk, with the same checkpoint.
 | `fps` (optional input) | The clip's frame rate (from Video Frames). Needed for lip sync when the clip isn't 24 fps: what the re-draw hears is retimed to match. The output soundtrack is always the original |
 | `conditioning` (optional input) | A text prompt (CLIPTextEncode, H3 text encoder) describing the clip. Unwired works well for most clips. See *Guiding the re-draw* |
 | `method` | **`regen2k` (default)** or **`ic`**: see *method ic* below |
-| `clip` (optional input) | The H3 text encoder (CLIPLoader, type `minimax`). Only `method = ic` uses it |
+| `clip` (optional input) | The H3 text encoder (CLIPLoader, type `minimax`). Only `method = ic` uses it, and only when wired: see *method ic* |
 
 The recipe: 102-frame chunks sharing 17, 70000-token tiles with 128 px overlap,
 fresh noise per chunk, the soundtrack pinned clean.
@@ -91,17 +91,21 @@ original frames in view while it re-draws, and hears its soundtrack: in
 side-by-side tests the people stayed the same people, text kept its strokes and
 mouths followed the speech.
 
-- Needs: the `clip` input (H3 text encoder), `audio_vae` (for the soundtrack), a
-  **plain ref2va DiT** (`minimax_h3_ref2va_*`, no LoRAs) as `model`, and the two
-  files from *Install* step 3.
+- Needs: `audio_vae` (for the soundtrack), a **plain ref2va DiT**
+  (`minimax_h3_ref2va_*`, no LoRAs) as `model`, and the two files from *Install*
+  step 3.
+- `clip` is optional. Unwired, ic uses its task prompt encoded once
+  (`upsample_ic_task.safetensors`, shipped with the pack) and no text encoder
+  loads. Wired, the text encoder is also shown each piece (NVlabs' recipe) and
+  loads once per run, before the DiT.
 - Costs more time: about 1.7x Regen2K in our tests (2 MP on an RTX 5090: ~25 s of
   compute per second of video). VRAM stays one piece's worth however long the clip.
 - Uses 119-frame pieces, euler and its own 3-step schedule; `lora` may name the IC
   file, `redraw_start` / `redraw_steps` are ignored. Tiling works: each tile sees
   its own window of the original frames (no visible seam in our tests). The
   small-face pass is skipped: IC keeps faces from your clip.
-- The text encoder loads once per run, before the DiT. On 32 GB of RAM expect it
-  and the DiT to be reloaded from disk; 64 GB holds both.
+- With `clip` wired on 32 GB of RAM, expect the text encoder and the DiT to be
+  reloaded from disk; 64 GB holds both. Unwired, only the DiT loads.
 
 - Wire a **plain** diffusion model loader as `model` (no LoRAs): LoRAs under the
   re-draw add their own texture.

@@ -533,8 +533,9 @@ class HTCVideoUpsampler:
             },
             "optional": {
                 "clip": ("CLIP", {"tooltip": (
-                    "The H3 text encoder (CLIPLoader, type minimax). Only method ic uses it: "
-                    "it is shown each piece of the clip.")}),
+                    "Optional, method ic only: the H3 text encoder (CLIPLoader, type minimax), "
+                    "shown each piece of the clip. Unwired, ic uses its task prompt encoded "
+                    "once (upsample_ic_task.safetensors) and no text encoder loads.")}),
                 "conditioning": ("CONDITIONING", {"tooltip": (
                     "Optional: a text prompt (CLIPTextEncode with the H3 text encoder) "
                     "describing the clip. Describe the look (\"2D anime, flat cel shading, "
@@ -802,7 +803,7 @@ def _redraw_ic(model, video, latent, n, src_size, length, latent_t, audio_t, ups
     sig_list = [round(float(s), 4) for s in sigmas]
     print(f"[{TAG}] {n} frames at {src_size[0]}x{src_size[1]} -> H3 canvas {w}x{h}, "
           f"{length} frames ({latent_t} latent steps), audio rows {audio_note}; "
-          f"{lora_tag}, euler, sigmas {sig_list}", flush=True)
+          f"{lora_tag}, prompt: {conds.note}, euler, sigmas {sig_list}", flush=True)
     overlap_px = int(_tu.CHAIN_DEFAULTS["tile_overlap_px"])
     out = _tu.upsample(model, zero_out_cond(), latent, sampler, str(upscale_model),
                        float(megapixels), 1.0, guide=None, budget=int(tile_tokens),
