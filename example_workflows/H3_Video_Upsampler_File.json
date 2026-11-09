@@ -1,8 +1,8 @@
 {
  "id": "h3-video-upsampler-file",
  "revision": 0,
- "last_node_id": 7,
- "last_link_id": 5,
+ "last_node_id": 8,
+ "last_link_id": 6,
  "nodes": [
   {
    "id": 1,
@@ -24,7 +24,7 @@
     "Node name for S&R": "MarkdownNote"
    },
    "widgets_values": [
-    "## H3 Video Upsampler (file to file)\n\nSame result as the IMAGE workflow, for clips of any length on any machine: the video is read, upscaled and saved **a piece at a time**, so RAM stays low however long it is.\n\n1. **Load Video**: pick the clip. Frame rate and sound come from the file.\n2. **Queue.** The MP4 lands in `video/H3_upsampled` with the original soundtrack.\n\n### Settings worth knowing\n- **megapixels / denoise / redraw_start / redraw_steps / tile_tokens / chunk_join / attention**: as in the IMAGE workflow.\n- **frame_rate**: `24 (H3 native)` converts to 24 fps while reading: exact lip sync and half the work for 48 fps clips. Add `frame_gen` x2 to get 48 fps back.\n- **frame_gen / codec / quality**: how the MP4 is saved. x2 doubles the frame rate (RTX + `nvidia-vfx`).\n- **reuse_encoded**: re-running the same clip with other settings starts faster.\n- **conditioning** (optional): a text prompt describing the look.\n\n**Faster VAE (optional):** in the VAE loader, `minimax_h3_sol_vae_fp16.safetensors` made a whole run about 20% faster in tests and looked the same apart from slightly softer hair edges. It needs a ComfyUI from late October 2026.\n"
+    "## H3 Video Upsampler (file to file)\n\nSame result as the IMAGE workflow, for clips of any length on any machine: the video is read, upscaled and saved **a piece at a time**, so RAM stays low however long it is.\n\n1. **Load Video**: pick the clip. Frame rate and sound come from the file.\n2. **Queue.** The MP4 lands in `video/H3_upsampled` with the original soundtrack.\n\n### Settings worth knowing\n- **megapixels / denoise / redraw_start / redraw_steps / tile_tokens / chunk_join / attention**: as in the IMAGE workflow.\n- **frame_rate**: `24 (H3 native)` converts to 24 fps while reading: exact lip sync and half the work for 48 fps clips. Add `frame_gen` x2 to get 48 fps back.\n- **frame_gen / codec / quality**: how the MP4 is saved. x2 doubles the frame rate (RTX + `nvidia-vfx`).\n- **reuse_encoded**: re-running the same clip with other settings starts faster.\n- **conditioning** (optional): a text prompt describing the look.\n\n**Faster VAE (optional):** in the VAE loader, `minimax_h3_sol_vae_fp16.safetensors` made a whole run about 20% faster in tests and looked the same apart from slightly softer hair edges. It needs a ComfyUI from late October 2026.\n- **method**: `regen2k` (default) or `ic`: in-context re-draw that keeps faces, text and mouths the clip's own (slower). For `ic`, switch **Load Diffusion Model** to `minimax_h3_ref2va_int8_convrot` (no LoRAs) and keep the **Load CLIP** below wired; it also needs `minimax_h3_open_regenerate_2k_ic_lora_avg_rank_21_bf16.safetensors` + `minimax_h3_hyperflow_8step_v1.0.safetensors` in models/loras. `regen2k` ignores the CLIP.\n"
    ]
   },
   {
@@ -201,6 +201,11 @@
      "type": "CONDITIONING",
      "link": null,
      "shape": 7
+    },
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 6
     }
    ],
    "outputs": [
@@ -278,6 +283,39 @@
     "Node name for S&R": "PreviewAny"
    },
    "title": "report"
+  },
+  {
+   "id": 8,
+   "type": "CLIPLoader",
+   "pos": [
+    -900,
+    340
+   ],
+   "size": [
+    420,
+    106
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "CLIP",
+     "type": "CLIP",
+     "links": [
+      6
+     ]
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CLIPLoader"
+   },
+   "widgets_values": [
+    "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+    "minimax",
+    "default"
+   ]
   }
  ],
  "links": [
@@ -320,6 +358,14 @@
    7,
    0,
    "STRING"
+  ],
+  [
+   6,
+   8,
+   0,
+   6,
+   5,
+   "CLIP"
   ]
  ],
  "groups": [],
