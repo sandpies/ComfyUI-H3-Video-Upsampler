@@ -305,8 +305,27 @@ def lora_paths(wanted=None):
             folder_paths.get_full_path_or_raise("loras", HYPERFLOW_LORA), sharp)
 
 
-def preflight(clip, lora=None, needs_clip=True):
-    """Fail before any work: the clip input and the files method ic needs."""
+NEEDS_DIT = ("method ic needs the plain official ref2va DiT "
+             "(UNETLoader: minimax_h3_ref2va_int8_convrot or another minimax_h3_ref2va_*, no "
+             "LoRAs). The fl2va / pruned builds and curve-form merges have no time embedder, "
+             "which IC's HyperFlow step needs.")
+
+
+def model_has_time_embedder(model):
+    """True / False for a ModelPatcher's DiT, None when it cannot be told."""
+    try:
+        dm = (model.get_model_object("diffusion_model") if hasattr(model, "get_model_object")
+              else model.model.diffusion_model)
+    except Exception:
+        return None
+    return getattr(dm, "time_embedder", None) is not None
+
+
+def preflight(clip, lora=None, needs_clip=True, model=None):
+    """Fail before any work: the DiT, the clip input and the files method ic needs."""
+    if model is not None and model_has_time_embedder(model) is False:
+        raise RuntimeError(f"{TAG}: the wired model has no time embedder. {NEEDS_DIT} "
+                           "Nothing was run.")
     if needs_clip and clip is None and load_task_cond() is None:
         raise RuntimeError(f"{TAG}: method ic needs the clip input wired (CLIPLoader with the "
                            f"H3 text encoder, type minimax), or {TASK_COND_FILE} beside "
@@ -349,8 +368,7 @@ def patch_model(model, ic_lora=None):
     m = model.clone()
     shapes = {k: tuple(v.shape) for k, v in m.model.state_dict().items()}
     if "diffusion_model.time_embedder.proj_in.weight" not in shapes:
-        raise RuntimeError(f"{TAG}: this DiT has no time_embedder (a curve-form merge?); "
-                           "method ic needs the plain official ref2va model.")
+        raise RuntimeError(f"{TAG}: this DiT has no time_embedder. {NEEDS_DIT}")
     hf_patches, hf_meta = _cached(hf_path, shapes, "patches")
     if hf_meta.get("hyperflow") != "true":
         raise RuntimeError(f"{TAG}: {HYPERFLOW_LORA} is not a HyperFlow weights file")

@@ -571,7 +571,7 @@ class HTCVideoUpsampler:
             audio=None, audio_vae=None, conditioning=None, fps=None, clip=None):
         check_vae(vae)
         if _ic.is_ic(method) and float(denoise) > 0.0:
-            _ic.preflight(clip, lora)
+            _ic.preflight(clip, lora, model=model)
         n = int(images.shape[0])
         if n < 1:
             raise ValueError(f"{TAG}: no frames")
@@ -898,7 +898,7 @@ class HTCVideoUpsamplerToFile:
 
         check_vae(vae)
         if _ic.is_ic(method) and float(denoise) > 0.0:
-            _ic.preflight(clip, lora)
+            _ic.preflight(clip, lora, model=model)
         t0 = time.perf_counter()
         to_24 = str(frame_rate) != FRAME_RATES[0]
         src = _video_file(video)
