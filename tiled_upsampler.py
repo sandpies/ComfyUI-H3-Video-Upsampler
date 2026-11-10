@@ -2546,8 +2546,9 @@ class HTCUpsampleSettings:
             "required": {
                 "steps": ("INT", {
                     "default": 3, "min": 1, "max": 8,
-                    "tooltip": "Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster, "
-                               "and in side-by-side tests looked the same."}),
+                    "tooltip": "Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
+                               "Regen2K it looked the same in side-by-side tests, for "
+                               "upsample_redraw ic it starts later, so less is re-drawn."}),
                 "start_sigma": ("FLOAT", {
                     "default": d["start_sigma"], "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": ("Leave at 0 (the Regen2K recipe; redraw_start sets how much "
@@ -2605,7 +2606,7 @@ class HTCUpsampleSettings:
                     "default": d["redraw_start"], "min": 0.3, "max": 0.95, "step": 0.05,
                     "tooltip": "How much the re-draw is allowed to change. 0.6 (default) "
                                "keeps faces close to the chain's frames; 0.8 = the original "
-                               "Regen2K recipe, sharper but faces drift more."}),
+                               "Regen2K recipe, sharper but faces drift more. Regen2K only."}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {

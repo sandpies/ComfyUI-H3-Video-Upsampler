@@ -478,7 +478,10 @@ class HTCVideoUpsampler:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": (
-                    "The H3 model (UNETLoader: minimax_h3_fl2va_pruned_int8_convrot).")}),
+                    "The H3 model (Load Diffusion Model). regen2k: "
+                    "minimax_h3_fl2va_pruned_int8_convrot. ic: the official "
+                    "minimax_h3_ref2va_int8_convrot with no LoRAs (the node stops before any "
+                    "work and says so if the model cannot run ic).")}),
                 "vae": ("VAE", {"tooltip": (
                     "The H3 video VAE. Tip: the sol-VAE (minimax_h3_sol_vae_fp16) made a "
                     "whole run about 20% faster in tests, with hair edges a touch softer.")}),
@@ -494,10 +497,13 @@ class HTCVideoUpsampler:
                 "denoise": ("FLOAT", {
                     "default": REGEN2K_DEFAULT_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.005,
                     "tooltip": ("How strongly the Regen2K LoRA re-draws detail. 0.8 = normal. "
-                                "0 = no re-draw, the clip is only enlarged.")}),
+                                "0 = no re-draw, the clip is only enlarged (for both methods). "
+                                "Under ic any value above 0 runs the ic re-draw.")}),
                 "lora": (loras, {
                     "default": REGEN2K_DEFAULT_LORA,
-                    "tooltip": f"The Regen2K LoRA, from models/loras ({REGEN2K_DEFAULT_LORA})."}),
+                    "tooltip": (f"The re-draw LoRA, from models/loras. regen2k: "
+                                f"{REGEN2K_DEFAULT_LORA}. ic: pick an IC file here, or leave it "
+                                "and the IC LoRA is found by itself.")}),
                 "tile_tokens": ("INT", {
                     "default": 0, "min": 0, "max": 1048576, "step": 1024,
                     "tooltip": ("How much work goes to the GPU at once. 0 = automatic (recommended): "
@@ -522,11 +528,12 @@ class HTCVideoUpsampler:
                     "tooltip": ("How much the re-draw is allowed to change. 0.6 (default) keeps "
                                 "faces close to your clip. 0.8 = the original Regen2K recipe: "
                                 "sharper, but faces drift more. Lower than 0.6 changes less "
-                                "again and sharpens less.")}),
+                                "again and sharpens less. regen2k only.")}),
                 "redraw_steps": (list(REDRAW_STEPS), {
                     "default": REDRAW_STEPS[0],
-                    "tooltip": ("Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster; "
-                                "in side-by-side tests it looked the same.")}),
+                    "tooltip": ("Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
+                                "regen2k it looked the same in side-by-side tests, for ic it "
+                                "starts later, so less is re-drawn.")}),
                 # appended last: widgets_values are positional
                 "method": (list(_ic.METHODS), {
                     "default": _ic.METHODS[0], "tooltip": _ic.METHOD_TIP}),
@@ -703,7 +710,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
         return _redraw_ic(model, video, latent, n, src_size, length, latent_t, audio_t,
                           upscale_model, megapixels, tile_tokens, redraw_seed, audio_vae,
                           attention, chunk_join, chunking, tiling, clip, vae, lora,
-                          sound=audio_note)
+                          sound=audio_note, steps=n_steps)
     model = model.clone() if hasattr(model, "clone") else model
     eff_lora = str(lora or "").strip()
     if not eff_lora or eff_lora == "None":
@@ -775,7 +782,7 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
 
 def _redraw_ic(model, video, latent, n, src_size, length, latent_t, audio_t, upscale_model,
                megapixels, tile_tokens, redraw_seed, audio_vae, attention, chunk_join,
-               chunking, tiling, clip, vae, lora=None, sound=None):
+               chunking, tiling, clip, vae, lora=None, sound=None, steps=None):
     """redraw() for method ic: the same upsample, with the IC-patched model, IC
     sigmas, the clip's soundtrack in the audio rows (encoded silence when there
     is none) and per-chunk in-context conditioning."""
@@ -789,6 +796,7 @@ def _redraw_ic(model, video, latent, n, src_size, length, latent_t, audio_t, ups
         print(f"[{TAG}] ic: the wired model already carries {len(model.patches)} patched "
               "weights (LoRAs?); IC was trained on the plain official ref2va model.", flush=True)
     model, sigmas, lora_tag = _ic.patch_model(model, lora)
+    sigmas = _ic.ic_sigmas(sigmas, steps)
     if sound is not None and sound.startswith("conditioned on the soundtrack"):
         # keep the clip's own audio rows that redraw() encoded: mouths shape to it
         audio_note = "the clip's soundtrack" + sound[len("conditioned on the soundtrack"):]

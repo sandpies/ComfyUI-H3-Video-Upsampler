@@ -88,8 +88,9 @@ mouths followed the speech.
   loads once per run, before the DiT.
 - Costs more time: about 1.7x Regen2K in our tests (2 MP on an RTX 5090: ~25 s of
   compute per second of video). VRAM stays one piece's worth however long the clip.
-- Uses 119-frame pieces, euler and its own 3-step schedule; `lora` may name the IC
-  file, `redraw_start` / `redraw_steps` are ignored. Tiling works: each tile sees
+- Uses 119-frame pieces, euler and its own 3-step schedule; `redraw_steps` 2 starts
+  one step later (about a third faster, a little less re-drawn; looked as good in
+  our tests). `lora` may name the IC file; `redraw_start` is ignored. Tiling works: each tile sees
   its own window of the original frames (no visible seam in our tests). The
   small-face pass is skipped: IC keeps faces from your clip.
 - With `clip` wired on 32 GB of RAM, expect the text encoder and the DiT to be

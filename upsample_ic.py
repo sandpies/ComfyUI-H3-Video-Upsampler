@@ -60,7 +60,7 @@ METHOD_TIP = ("regen2k = the Regen2K LoRA re-draws detail from the enlarged clip
               "clip's own (slower). ic needs audio_vae for the soundtrack and, in "
               "models/loras, an IC LoRA "
               f"({IC_LORA_SMALL}, 200 MB) + {HYPERFLOW_LORA} (+ {SHARP_LORA}). Under ic, lora "
-              "picks the IC file when it names one; redraw_start and redraw_steps are ignored. "
+              "picks the IC file when it names one; redraw_steps 2 starts one step later (less re-drawn, about a third faster); redraw_start is ignored. "
               "Tiles only when a piece is too big for the GPU; each tile then sees its own "
               "window of the original frames.")
 
@@ -405,6 +405,17 @@ def patch_model(model, ic_lora=None):
             + f"step {ic_meta.get('training_step', '?')})")
     m._htc_ic_embedder = emb
     return m, sigmas, note
+
+
+def ic_sigmas(sigmas, steps=None):
+    """The last `steps` steps of the IC schedule (1-3; None or more = all 3).
+    2 = 0.697 / 0.469 / 0: starts one grid point later, so less is re-drawn
+    and it runs about a third faster. HyperFlow's step embedder is told the
+    next sigma on every call, so any tail of its grid is a valid schedule."""
+    sig = [float(s) for s in sigmas]
+    full = len(sig) - 1
+    n = full if steps is None else max(1, min(full, int(steps)))
+    return sig[full - n:]
 
 
 def embedder_misses(model):
