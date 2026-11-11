@@ -1230,6 +1230,36 @@ def record_budget(key, used, final, samples):
                                           f"{oom_at})" if oom_at else ""))
 
 
+def _block_forward_takes_attention(model):
+    """Whether this model's patched H3 block forwards accept core's `attention`.
+
+    Core calls every replaced ("double_block") block with attention=... ,
+    sparse attention's producer or None. ComfyUI-KJNodes before its
+    2026-09-06 fix patches DiTBlock.forward without that argument, and the
+    run ends in the first block with "minimax_block_lowmem_forward() got an
+    unexpected keyword argument 'attention'". -> False when this model's
+    block patches would raise that.
+    """
+    import inspect
+    try:
+        from comfy.ldm.minimax.model import DiTBlock
+        if "attention" not in inspect.signature(DiTBlock.forward).parameters:
+            return True         # this core never passes it: nothing to clash with
+    except Exception:  # noqa: BLE001 -- no core module to compare against
+        return True
+    for name, obj in (getattr(model, "object_patches", None) or {}).items():
+        parts = str(name).split(".")
+        if (len(parts) < 4 or parts[-1] != "forward" or parts[-3] != "blocks"
+                or not parts[-2].isdigit()):
+            continue
+        try:
+            if "attention" not in inspect.signature(obj).parameters:
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
 def apply_sparse_attention(model):
     """ComfyUI's Model Sparse Attention (sol-attn, its defaults) on every step
     of the re-draw. -> (model, note). Kijai's low-VRAM attention composes with
@@ -1239,6 +1269,9 @@ def apply_sparse_attention(model):
                                                          parse_block_list)
     except Exception as exc:  # noqa: BLE001
         return model, f"dense (this ComfyUI has no sparse attention: {exc.__class__.__name__})"
+    if not _block_forward_takes_attention(model):
+        return model, ("dense (ComfyUI-KJNodes is too old for sparse attention: "
+                       "update it)")
     try:
         m = apply_block_sparse_attention(
             model, tau=1.3, topk_ratio=0.0, vsa=False, start_percent=0.0, end_percent=1.0,
