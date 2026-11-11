@@ -82,6 +82,8 @@ Leave the rest at their defaults: they adjust themselves to your graphics card.
   (`regen2k`; `ic` keeps faces from your clip anyway). It needs OpenCV, which most
   ComfyUI installs have.
 - **Anime getting extra lines?** Add a `conditioning` prompt describing the look.
+- **Log says `dense (ComfyUI-KJNodes is too old for sparse attention: update it)`?**
+  The run still works, just slower. Update ComfyUI-KJNodes to get sparse attention back.
 
 ## Credits
 
