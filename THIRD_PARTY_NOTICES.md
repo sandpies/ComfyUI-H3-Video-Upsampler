@@ -17,6 +17,14 @@ trained against. `tools/check_tiled_upsampler.py --weights` runs the real
 checkpoint through this module and through theirs and requires identical
 output. Everything else in the file is this pack's code.
 
+The 2D release (`2d_conv_v1`, 2026-11-10; `LatentUpscaler2D` in this file) is
+the same arrangement: its layout (2D residual blocks per frame, two shared
+temporal blocks applied after every other block, a bilinear resize, the
+Fourier scale-and-sharpness-tier embedding, the 32-frame pieces with their
+temporal context) and key names are theirs, from `nodes/minimax_h3_latent_upscaler_2d.py`
+(MIT); the module is written for this pack. `tools/check_upscaler_2d.py --ref`
+runs the real 2D weights through both and requires matching output.
+
 When ComfyUI core has its own H3 latent upscaler (`comfy/ldm/minimax/latent_upscaler.py`, Kijai, [ComfyUI PR #17412](https://github.com/Comfy-Org/ComfyUI/pull/17412), GPL-3.0), `upscale_film` calls it at runtime through core's own Load Latent Upscale Model. None of its code is copied here; the bundled module remains the fallback.
 
 The node's recipe -- chunk and tile sizes, the joint-step tiling, one step at

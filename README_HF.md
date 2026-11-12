@@ -36,6 +36,11 @@ Needs **ComfyUI v0.38.0 or newer**.
 | [`minimax_h3_latent_upscaler_3d_conv_v1_bf16`](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/blob/main/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors) | `models/latent_upscale_models` | small |
 | [`open_h3_regenerate_2k_r256pp_bf16.safetensors`](https://huggingface.co/sandpies/ComfyUI-H3-Video-Upsampler/blob/main/lora/open_h3_regenerate_2k_r256pp_bf16.safetensors) | `models/loras` | 3.8 GB |
 
+The latent upscaler can instead be LBH-123-AI's 2D one,
+[`minimax_h3_latent_upscaler_2d_conv_v1_bf16`](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler/blob/main/minimax_h3_latent_upscaler_2d_conv_v1/minimax_h3_latent_upscaler_2d_conv_v1_bf16.safetensors)
+(same folder, 0.36 GB): pick it in `upscale_model` and set `sharpness`. The old 3D file name,
+`minimax_h3_latent_upscaler_3d_bf16.safetensors`, still loads.
+
 That's everything for the normal mode. Optional: [`minimax_h3_sol_vae_fp16`](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_sol_vae_fp16.safetensors)
 in place of the video VAE makes a run about 20% faster (needs a ComfyUI from late October 2026).
 
@@ -68,6 +73,7 @@ Hover any setting in ComfyUI for a short explanation. The ones you might change:
 | `redraw_steps` | **3** is the normal recipe. **2** is a third faster and looked the same in our tests. |
 | `redraw_start` | How much the re-draw may change (`regen2k` only). **0.6** keeps faces close; 0.8 is sharper but faces can change. |
 | `denoise` | **0** only enlarges, with no re-draw. |
+| `sharpness` | Only with the 2D latent upscaler: **1** stays closest to your clip, **6** is sharpest. The 3D upscaler ignores it. |
 | `conditioning` | Optional text describing the look, e.g. *"2D anime, flat cel shading"*. Helps animation. |
 
 Leave the rest at their defaults: they adjust themselves to your graphics card.
