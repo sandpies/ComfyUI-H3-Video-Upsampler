@@ -100,3 +100,22 @@ split switches, prompted the upsampler's `chunking` / `tiling` switches. HTC's
 version is its own design and code: time is cut before space, Regen2K's
 68-frame floor is kept, and chunking stays automatic for clips too long for
 one pass. Nothing from that repository is included.
+
+## `htc_adaln.py` — MiniMax-H3 AdaLN LoRA porting (`HTCAdaLNFix` & built-in callers)
+
+**Original author: [PlagueKind](https://github.com/PlagueKind) ([`ComfyUI-H3-AdaLN-LoRA-Fix`](https://github.com/PlagueKind/ComfyUI-PlagueKind-Nodes), MIT, Copyright (c) 2026 PlagueKind).**
+
+`htc_adaln.py` ports PlagueKind's MIT AdaLN basis-projection math (`silu_temb_grid`,
+least-squares `solve_basis`, `port_delta`, `port_factors_reverse`) and ModelPatcher
+rewriting (`fix_model`) directly into Hand Tie Clips so `HTCTokenLoRA`,
+`HandTieClips` (`realism_boost`), `HTCTiledUpsampler`, `HTCVideoUpsampler`,
+MV Studio's Image Forge, and the standalone `HTCAdaLNFix` node all port dense
+and curve-form H3 AdaLN LoRAs automatically with zero external custom-node
+dependency.
+
+## `sparse_attn.py` — Clean-room MIT sparse & low-VRAM attention (`HTCSparseAttention`)
+
+Written fresh under MIT directly on stock `comfy_kitchen` (`ck.sol_attn`,
+`ck.sol_attn_chunked`) and ComfyUI Core (`MiniMaxH3Model`, `AttentionTensorContainer`,
+`comfy.ops.linear_input_act`). No AGPL or GPL code from external custom-node
+packs (`ComfyUI-UtilsCollection`, `ComfyUI-KJNodes`) is copied.

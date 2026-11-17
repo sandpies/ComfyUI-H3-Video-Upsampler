@@ -148,6 +148,7 @@ def check_audio_length(audio, n_frames, fps):
               f"; the clip may be {n_frames / a_s:.3g} fps, wire fps from the video"
               if not fps else ""), flush=True)
 
+
 def pad_frames(images, length):
     """Repeat the last frame up to `length` (the VAE pads a short clip the same way)."""
     n = int(images.shape[0])
@@ -555,12 +556,14 @@ class HTCVideoUpsampler:
                     "tooltip": ("How much the re-draw is allowed to change. 0.6 (default) keeps "
                                 "faces close to your clip. 0.8 = the original Regen2K recipe: "
                                 "sharper, but faces drift more. Lower than 0.6 changes less "
-                                "again and sharpens less. regen2k only.")}),
+                                "again and sharpens less. regen2k; under ic: the face "
+                                "close-ups only.")}),
                 "redraw_steps": (list(REDRAW_STEPS), {
                     "default": REDRAW_STEPS[0],
                     "tooltip": ("Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
                                 "regen2k it looked the same in side-by-side tests, for ic it "
-                                "starts later, so less is re-drawn.")}),
+                                "starts later, so less is re-drawn. Also the steps of the "
+                                "face close-ups.")}),
                 # appended last: widgets_values are positional
                 "method": (list(_ic.METHODS), {
                     "default": _ic.METHODS[0], "tooltip": _ic.METHOD_TIP}),
@@ -568,6 +571,9 @@ class HTCVideoUpsampler:
                 "sharpness": ("INT", {
                     "default": _tu.SHARPNESS, "min": 1, "max": _tu.SHARPNESS_MAX, "step": 1,
                     "tooltip": _tu.SHARPNESS_TIP}),
+                # appended last: widgets_values are positional
+                "face_pass": (list(FACE_PASS_MODES), {
+                    "default": "auto", "tooltip": FACE_PASS_TIP}),
             },
             "optional": {
                 "clip": ("CLIP", {"tooltip": (
@@ -606,11 +612,15 @@ class HTCVideoUpsampler:
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
             attention="sparse", chunk_join="stepped", chunking=True, tiling=True,
             redraw_start=0.6, redraw_steps=REDRAW_STEPS[0], method=_ic.METHODS[0],
-            sharpness=_tu.SHARPNESS,
+            sharpness=_tu.SHARPNESS, face_pass="auto",
             audio=None, audio_vae=None, conditioning=None, fps=None, clip=None):
         check_vae(vae)
         if _ic.is_ic(method) and float(denoise) > 0.0:
             _ic.preflight(clip, lora, model=model)
+            if face_pass_on(face_pass, method, denoise):
+                # the close-ups are Regen2K: fail now, not after the ic pass
+                import folder_paths  # noqa: PLC0415
+                folder_paths.get_full_path_or_raise("loras", REGEN2K_DEFAULT_LORA)
         n = int(images.shape[0])
         if n < 1:
             raise ValueError(f"{TAG}: no frames")
@@ -628,17 +638,41 @@ class HTCVideoUpsampler:
             method=method, clip=clip, vae=vae, sharpness=sharpness)
         img = decode_streamed(vae.decode, vid, n)
         del vid
-        # IC keeps faces from the draft: the small-face close-ups are Regen2K's fix
-        if float(denoise) > 0.0 and not _ic.is_ic(method):
+        # auto: Regen2K only (IC keeps faces from the draft); on: under ic too, small
+        # faces only, drawn by Regen2K. See face_pass_on.
+        if face_pass_on(face_pass, method, denoise):
             img = img.float().cpu()
             img, note = _fp.apply(img, images, close_up_fn(
-                vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
-                redraw_seed, audio, audio_vae, fps, attention, chunk_join, chunking, tiling,
-                redraw_start, redraw_steps, method=method, clip=clip, sharpness=sharpness),
-                float(fps) if fps else float(H3_FPS))
+                vae, model, upscale_model, close_up_strength(method, denoise), lora,
+                tile_tokens, sampler_name, redraw_seed, audio, audio_vae, fps, attention,
+                chunk_join, chunking, tiling, redraw_start, redraw_steps,
+                method=_ic.METHODS[0], clip=clip, sharpness=sharpness),
+                float(fps) if fps else float(H3_FPS), small_only=_ic.is_ic(method))
             report += note
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
                 report)
+
+
+FACE_PASS_MODES = ("auto", "on", "off")
+FACE_PASS_TIP = (
+    "The small-face close-up re-draw (faces about 280 px tall or less in the output). "
+    "auto = with regen2k only, as before. on = also under ic: there only faces under "
+    "about 220 px, at most 2, drawn by Regen2K (ic keeps larger faces well and costs "
+    "more). off = never, which saves its time.")
+
+
+def face_pass_on(face_pass, method, denoise):
+    """Whether the close-up pass runs: off/denoise 0/face_pass.FACE_PASS False = never;
+    on = under either method; auto = Regen2K only (ic keeps faces from the draft)."""
+    if float(denoise) <= 0.0 or not _fp.FACE_PASS or str(face_pass) == "off":
+        return False
+    return str(face_pass) == "on" or not _ic.is_ic(method)
+
+
+def close_up_strength(method, denoise):
+    """The close-ups are always Regen2K: under ic `denoise` is the IC strength, so
+    they take Regen2K's own default instead."""
+    return REGEN2K_DEFAULT_STRENGTH if _ic.is_ic(method) else float(denoise)
 
 
 def close_up_fn(vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
@@ -765,12 +799,11 @@ def redraw(model, video, n, src_size, upscale_model, megapixels, denoise, lora,
         model = nodes.LoraLoaderModelOnly().load_lora_model_only(
             model, eff_lora, eff_strength)[0]
         lora_tag = f"{eff_lora} @ {eff_strength:g}"
-    # As upsample_chain: port dense LoRA AdaLN patches (pruned DiTs).
-    fix = getattr(nodes, "NODE_CLASS_MAPPINGS", {}).get("H3AdaLNLoRAFix")
-    if fix is not None and hasattr(model, "patches"):
+    # As upsample_chain: port dense LoRA AdaLN patches (pruned DiTs) via built-in MIT htc_adaln.
+    if hasattr(model, "patches"):
         try:
-            res = fix.execute(model=model, mode="port")
-            model = (res.args if hasattr(res, "args") else tuple(res))[0]
+            from . import htc_adaln as _adaln
+            model, _rep = _adaln.fix_model(model, mode="port")
         except Exception:
             pass
 
@@ -885,7 +918,7 @@ class HTCVideoUpsamplerToFile:
             "The clip (Load Video or Load Video (path)). It's read a piece at a time, so "
             "any length works; frame rate and sound come from the file.")})}
         for k, v in base["required"].items():
-            if k not in ("images", "method", "sharpness"):
+            if k not in ("images", "method", "sharpness", "face_pass"):
                 req[k] = v
         try:
             from .save_video import CPU_CODECS, FRAME_GEN, QUALITY
@@ -912,6 +945,7 @@ class HTCVideoUpsamplerToFile:
             "Cleared when ComfyUI restarts.")})
         req["method"] = base["required"]["method"]      # appended last: positional
         req["sharpness"] = base["required"]["sharpness"]  # appended after method
+        req["face_pass"] = base["required"]["face_pass"]  # appended after sharpness
         opt = {k: v for k, v in base["optional"].items()
                if k in ("audio_vae", "conditioning", "clip")}
         return {"required": req, "optional": opt,
@@ -933,7 +967,7 @@ class HTCVideoUpsamplerToFile:
             redraw_steps=REDRAW_STEPS[0], frame_gen="off",
             codec="auto", quality="max", filename_prefix="video/H3_upsampled",
             frame_rate=FRAME_RATES[0], reuse_encoded=True, method=_ic.METHODS[0],
-            sharpness=_tu.SHARPNESS,
+            sharpness=_tu.SHARPNESS, face_pass="auto",
             audio_vae=None, conditioning=None, clip=None, prompt=None, extra_pnginfo=None):
         import hashlib
         import json
@@ -943,6 +977,10 @@ class HTCVideoUpsamplerToFile:
         check_vae(vae)
         if _ic.is_ic(method) and float(denoise) > 0.0:
             _ic.preflight(clip, lora, model=model)
+            if face_pass_on(face_pass, method, denoise):
+                # the close-ups are Regen2K: fail now, not after the ic pass
+                import folder_paths  # noqa: PLC0415
+                folder_paths.get_full_path_or_raise("loras", REGEN2K_DEFAULT_LORA)
         t0 = time.perf_counter()
         to_24 = str(frame_rate) != FRAME_RATES[0]
         src = _video_file(video)
@@ -1002,21 +1040,22 @@ class HTCVideoUpsamplerToFile:
         del lat
         out_w, out_h = int(vid.shape[4]) * _tu.SPATIAL, int(vid.shape[3]) * _tu.SPATIAL
         slices = decode_slices(vae.decode, vid, n)
-        # IC keeps faces from the draft: the small-face close-ups are Regen2K's fix
-        if float(denoise) > 0.0 and _fp.FACE_PASS and not _ic.is_ic(method):
+        # auto: Regen2K only (IC keeps faces from the draft); on: under ic too
+        if face_pass_on(face_pass, method, denoise):
             # Small faces: found and cut from the source in two more reads of the
             # file (nothing held but the crops), re-drawn as close-ups, pasted
             # into each decoded slice on its way to the encoder.
             sx, sy = out_w / float(src_size[0]), out_h / float(src_size[1])
             dets = _fp.detect_batches(source_batches())
-            jobs = _fp.select(dets, n, (sx + sy) / 2.0) if dets is not None else []
+            jobs = (_fp.select(dets, n, (sx + sy) / 2.0, small_only=_ic.is_ic(method))
+                    if dets is not None else [])
             if jobs:
                 crops = _fp.crops_from_batches(jobs, source_batches())
                 _fp.render(jobs, crops, close_up_fn(
-                    vae, model, upscale_model, denoise, lora, tile_tokens, sampler_name,
-                    redraw_seed, audio, audio_vae, fps, attention, chunk_join, chunking,
-                    tiling, redraw_start, redraw_steps, method=method, clip=clip,
-                    sharpness=sharpness), fps)
+                    vae, model, upscale_model, close_up_strength(method, denoise), lora,
+                    tile_tokens, sampler_name, redraw_seed, audio, audio_vae, fps, attention,
+                    chunk_join, chunking, tiling, redraw_start, redraw_steps,
+                    method=_ic.METHODS[0], clip=clip, sharpness=sharpness), fps)
                 del crops
                 slices = _paste_stream(slices, jobs, sx, sy)
             if dets is not None:

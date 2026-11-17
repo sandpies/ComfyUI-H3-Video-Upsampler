@@ -127,7 +127,7 @@ LOCK_SIGMA = 2.0
 #   errors the 3D upscaler adds -- a blown patch, a colour shift -- are pulled
 #   back too); upscaler = the 3D upscaler's output.
 ATTENTION_MODES = ("dense", "sparse")
-JOIN_MODES = ("crossfade", "stepped")
+JOIN_MODES = ("crossfade", "stepped", "windowed")
 LOCK_ANCHORS = ("source", "upscaler")
 # tile_context (draft): what a tile knows about the rest of its frame. none =
 #   only its own window (and structure_lock's anchor). global pass = before the
@@ -158,8 +158,14 @@ Guide = collections.namedtuple("Guide", "factor cond decode encode pixels")
 
 FOLDER = "latent_upscale_models"
 SPATIAL = 16                # H3 video VAE: pixels per latent cell
-FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
-FRAME_RESCALE = 5.0 / 3.0   # audio latent steps per pixel frame (40 vs 24 Hz)
+try:
+    from comfy.ldm.minimax.model import FRAME_PER_TOKEN as _CORE_FPT, FRAME_RESCALE as _CORE_FR  # type: ignore[import-not-found]
+    FRAME_PER_TOKEN = tuple(_CORE_FPT)
+    FRAME_RESCALE = float(_CORE_FR)
+    assert FRAME_PER_TOKEN == (1, 4, 4, 4, 4) and abs(FRAME_RESCALE - 5.0 / 3.0) < 1e-6
+except ImportError:
+    FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+    FRAME_RESCALE = 5.0 / 3.0   # audio latent steps per pixel frame (40 vs 24 Hz)
 
 # The statistics LBH-123-AI's weights were trained against (24 channels).
 LATENT_MEAN = (
@@ -598,26 +604,26 @@ def clean_refs(cond):
 
 
 def _keyframe_in(kf, f0, f1):
-    """The part of keyframe `kf` lying wholly inside frames [f0, f1), re-based
-    to f0, or None."""
+    """The part of keyframe `kf` overlapping frames [f0, f1) on 5-latent starts,
+    re-based to f0, or None (matches ComfyUI #17425 `_window_payload`)."""
     idx = kf["resolved_frame_index"]
     lt, al = kf.get("latent"), kf.get("audio_latent")
     if lt is None and al is None:
         return {"resolved_frame_index": idx - f0} if f0 <= idx < f1 else None
     out = {}
     if lt is not None:
-        first = last = None
-        pos = idx
-        for k in range(lt.shape[2]):
-            span = FRAME_PER_TOKEN[k % 5]
-            if f0 <= pos and pos + span <= f1:
-                first = k if first is None else first
-                last = k + 1
-            pos += span
-        if first is None:
+        vt = int(lt.shape[2])
+        g_starts = [0]
+        for k in range(vt):
+            g_starts.append(g_starts[-1] + FRAME_PER_TOKEN[k % 5])
+        hits = [g for g in range(0, vt, 5)
+                if idx + g_starts[g] < f1 and idx + g_starts[min(g + 5, vt)] > f0]
+        if not hits:
             return None
+        first = hits[0]
+        last = min(vt, hits[-1] + 5)
         out["latent"] = lt[:, :, first:last].contiguous()
-        out["resolved_frame_index"] = idx + frames_in(first) - f0
+        out["resolved_frame_index"] = idx + g_starts[first] - f0
     if al is not None:
         a0 = max(0, math.ceil((f0 - idx) * FRAME_RESCALE))
         a1 = min(al.shape[-1], math.floor((f1 - idx) / FRAME_RESCALE))
@@ -1517,48 +1523,62 @@ def _block_forward_takes_attention(model):
 
 def apply_sparse_attention(model):
     """ComfyUI's Model Sparse Attention (sol-attn, its defaults) on every step
-    of the re-draw. -> (model, note). Kijai's low-VRAM attention composes with
-    it. A ComfyUI without the node runs dense."""
-    try:
-        from comfy_extras.nodes_sparse_attention import (apply_block_sparse_attention,
-                                                         parse_block_list)
-    except Exception as exc:  # noqa: BLE001
-        return model, f"dense (this ComfyUI has no sparse attention: {exc.__class__.__name__})"
+    of the re-draw, with built-in MIT `sparse_attn` fallback. -> (model, note).
+
+    Both sparse paths install `double_block` patches, and core calls a replaced
+    block with `attention=`: under ComfyUI-KJNodes before its 2026-09-06 fix that
+    raises in the first block, so that case stays dense (3.5.1 behaviour)."""
     if not _block_forward_takes_attention(model):
         return model, ("dense (ComfyUI-KJNodes is too old for sparse attention: "
                        "update it)")
     try:
+        from comfy_extras.nodes_sparse_attention import (apply_block_sparse_attention,
+                                                         parse_block_list)
         m = apply_block_sparse_attention(
             model, tau=1.3, topk_ratio=0.0, vsa=False, start_percent=0.0, end_percent=1.0,
             min_tokens=12288, dense_blocks=parse_block_list(""),
             sink_conditioning="exact_kv_and_rows", extra_tokens=256, verbose=False)
+        return m, "sparse (sol-attn, tau 1.3)"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from . import sparse_attn as _sa
+    except ImportError:
+        import sparse_attn as _sa
+    try:
+        m = _sa.apply_sparse_attention(
+            model, preset="manual", method="sol-attn", tau=1.3, tail=True,
+            extra_tokens=256, sink_mode="exact_kv_and_rows",
+            dense_first_steps=0, dense_first_percent=0.0, dense_last_steps=0,
+            dense_layers="", min_tokens=12288, chunked_qkv=True,
+            dense_head_chunks=1, disable_fp16_accum=False)
+        return m, "sparse (built-in sol-attn, tau 1.3)"
     except Exception as exc:  # noqa: BLE001 -- another core's signature: dense, not a failed run
         return model, f"dense (sparse attention failed: {exc.__class__.__name__}: {exc})"
-    return m, "sparse (sol-attn, tau 1.3)"
 
 
 def _apply_low_vram_patches(model, attn_chunks=4, ffn_chunks=2):
-    """Apply AdaLN port, 4-way attention head chunking, and 2-way SwiGLU FFN
-    token chunking (as in Seanaiochat.json's MiniMaxLowVRAMAttention(4) +
-    MiniMaxChunkFeedForward(2, 4096)) onto `model` so tiled upsampling uses
-    minimal activation VRAM even when `upsample_dit` is wired from a bare
-    UNETLoader. Mathematically identical to the unchunked forward."""
+    """Apply built-in MIT AdaLN port, `attn_chunks`-way attention head chunking,
+    and `ffn_chunks`-way SwiGLU FFN token chunking onto `model` so tiled
+    upsampling uses minimal activation VRAM with zero external custom-node
+    dependencies. Mathematically identical to the unchunked forward."""
     if model is None or not hasattr(model, "get_model_object"):
         return model
     try:
-        import nodes as _nodes_mod
-        nmap = getattr(_nodes_mod, "NODE_CLASS_MAPPINGS", {}) or {}
-        if hasattr(model, "patches") and "H3AdaLNLoRAFix" in nmap:
-            _res = nmap["H3AdaLNLoRAFix"].execute(model=model, mode="port")
-            model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
-        if int(attn_chunks) > 1 and "MiniMaxLowVRAMAttention" in nmap:
-            _res = nmap["MiniMaxLowVRAMAttention"].execute(
-                model=model, head_chunks=int(attn_chunks))
-            model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
-        if int(ffn_chunks) > 1 and "MiniMaxChunkFeedForward" in nmap:
-            _res = nmap["MiniMaxChunkFeedForward"].execute(
-                model=model, chunks=int(ffn_chunks), seq_threshold=4096)
-            model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
+        if __package__:
+            from . import htc_adaln as _adaln
+            from . import sparse_attn as _sa
+        else:
+            import htc_adaln as _adaln
+            import sparse_attn as _sa
+        if hasattr(model, "patches"):
+            model, _rep = _adaln.fix_model(model, mode="port")
+        if int(attn_chunks) > 1:
+            model = _sa.apply_low_vram_attention(model, head_chunks=int(attn_chunks))
+        # FFN chunking is a `double_block` patch: skip it where a replaced block
+        # would be called with `attention=` it cannot take (old KJNodes).
+        if int(ffn_chunks) > 1 and _block_forward_takes_attention(model):
+            model = _sa.apply_chunk_ffn(model, chunks=int(ffn_chunks), seq_threshold=4096)
     except Exception:
         pass
     return model
@@ -1674,15 +1694,33 @@ def structure_lock_fn(anchor, strength, sigma=LOCK_SIGMA):
     def fn(args):
         d = args["denoised"]
         flat = d.reshape(d.shape[0], -1)
-        if strength <= 0.0 or flat.shape[1] < n or d.shape[0] != shape[0]:
+        if strength <= 0.0 or d.shape[0] != shape[0]:
             return d
-        a_low = held.get(d.device)
+        if flat.shape[1] >= n:
+            use_anchor = anchor
+            use_shape = shape
+            use_n = n
+            key = (d.device, None)
+        else:
+            cw = ((args.get("model_options") or {}).get("transformer_options") or {}).get("context_window")
+            idx_list = getattr(cw, "index_list", None) if cw is not None else None
+            if not idx_list:
+                return d
+            sub_shape = (shape[0], shape[1], len(idx_list), shape[3], shape[4])
+            sub_n = math.prod(sub_shape[1:])
+            if flat.shape[1] < sub_n:
+                return d
+            use_anchor = anchor[:, :, idx_list]
+            use_shape = sub_shape
+            use_n = sub_n
+            key = (d.device, tuple(int(i) for i in idx_list))
+        a_low = held.get(key)
         if a_low is None:
-            a_low = held[d.device] = _blur_hw(anchor.to(d.device, torch.float32), sigma)
-        v = flat[:, :n].reshape(shape).float()
+            a_low = held[key] = _blur_hw(use_anchor.to(d.device, torch.float32), sigma)
+        v = flat[:, :use_n].reshape(use_shape).float()
         v = v + strength * (a_low - _blur_hw(v, sigma))
         out = flat.clone()
-        out[:, :n] = v.reshape(shape[0], -1).to(out.dtype)
+        out[:, :use_n] = v.reshape(use_shape[0], -1).to(out.dtype)
         return out.reshape(d.shape)
     return fn
 
@@ -1730,7 +1768,8 @@ def _cond_resized(cond, h, w):
 
 
 def global_pass(model, cond, sampler, sigmas, video, audio, seed, budget,
-                lock_src=None, structure_lock=0.0, lock_sigma=LOCK_SIGMA, factor=1):
+                lock_src=None, structure_lock=0.0, lock_sigma=LOCK_SIGMA, factor=1,
+                budget_t=None):
     """`video` re-drawn whole-frame at the largest size whose sequence fits
     `budget`, then brought back to its own grid. -> (latent, note); the
     latent is None when it would not help (it fits whole already, a guided
@@ -1740,7 +1779,8 @@ def global_pass(model, cond, sampler, sigmas, video, audio, seed, budget,
     if int(factor) > 1:
         return None, ""
     _, _, t, h, w = video.shape
-    full = seq_len(w * SPATIAL, h * SPATIAL, t)
+    t_eff = min(int(t), int(budget_t)) if budget_t else int(t)
+    full = seq_len(w * SPATIAL, h * SPATIAL, t_eff)
     scale = math.sqrt(float(budget) / float(full))
     if scale >= 1.0:
         return None, ""
@@ -1765,7 +1805,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
                  detail_sigma=0.0, noise_video=None, structure_lock=STRUCTURE_LOCK,
                  lock_sigma=LOCK_SIGMA, anchor=None, allow_tiles=True,
-                 tile_context="none"):
+                 tile_context="none", budget_t=None):
     """Every tile stepped together, merged under the feather after each step.
 
     Step 0 hands each tile its slice of one noise field drawn at the chunk's
@@ -1781,6 +1821,9 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     instead of a retry in tiles. `tile_context` "global pass" re-draws the
     chunk whole-frame at a reduced size first and holds the tiles' large
     shapes to it (see TILE_CONTEXTS).
+    `budget_t` overrides the temporal latent step count used for tile-grid
+    budgeting (used by ComfyUI #17425 context-windowed whole-clip passes so
+    the budget counts per-window tokens rather than full-clip tokens).
     Includes an automatic OOM guardrail: if a tile forward runs out of VRAM at
     `budget`, halves the tile token budget to split into smaller tiles and
     retries the chunk automatically.
@@ -1789,6 +1832,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     import comfy.sample
 
     _, _, t, h, w = video.shape
+    t_budget = min(int(t), int(budget_t)) if budget_t else int(t)
     field = comfy.sample.prepare_noise(nt.NestedTensor((video, audio)), seed)
     nv, na = field.tensors[0], field.tensors[1]
     if noise_video is not None:
@@ -1803,7 +1847,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     extra = _cond_extra_tokens(cond)
     lock_src = video if anchor is None else anchor.to(device=video.device, dtype=video.dtype)
     while True:
-        tiles, grid = tile_grid(h, w, t, factor,
+        tiles, grid = tile_grid(h, w, t_budget, factor,
                                 max(4096, cur_budget - extra) if allow_tiles else 1 << 40,
                                 overlap_px)
         prepared = []
@@ -1816,11 +1860,12 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                                    structure_lock, lock_sigma)
                  if float(structure_lock) > 0.0 else None
                  for (r0, c0, rows, cols, *_rest) in prepared]
-        tokens = (seq_len(grid[2], grid[3], t) if int(factor) <= 1
-                  else f"{guided_seq_len(grid[2], grid[3], t, factor)} (guide incl.)")
-        _LAST_TOKENS[0] = factor_seq_len(grid[2], grid[3], t, factor) + extra
+        tokens = (seq_len(grid[2], grid[3], t_budget) if int(factor) <= 1
+                  else f"{guided_seq_len(grid[2], grid[3], t_budget, factor)} (guide incl.)")
+        _LAST_TOKENS[0] = factor_seq_len(grid[2], grid[3], t_budget, factor) + extra
         _sig_s = [round(float(s), 4) for s in sigmas]
-        print(f"[{TAG}] chunk {w * SPATIAL}x{h * SPATIAL}px x {t} latent steps: "
+        _t_label = f"{t} latent steps" if t_budget == t else f"{t} latent steps ({t_budget} per window)"
+        print(f"[{TAG}] chunk {w * SPATIAL}x{h * SPATIAL}px x {_t_label}: "
               f"{grid[0]}x{grid[1]} tiles of {grid[2]}x{grid[3]}px, overlap "
               f"{grid[4]}/{grid[5]}px, {tokens} tokens per "
               f"forward, stepped together, sigmas {_sig_s}"
@@ -1856,7 +1901,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                     g, g_note = global_pass(
                         model, cond, sampler, sigmas, video, audio, seed,
                         max(4096, cur_budget - extra), lock_src, structure_lock, lock_sigma,
-                        factor)
+                        factor, budget_t=budget_t)
                     if g is not None:
                         _calls += 1
                         locks = [structure_lock_fn(g[:, :, :, r0:r0 + rows, c0:c0 + cols],
@@ -2148,6 +2193,95 @@ def _regen2k_chunk_frames(w_px, h_px, budget, chunk_frames=_DEFAULT_CHUNK_FRAMES
     return cf, grid
 
 
+def _core_windows_ready():
+    """True when installed ComfyUI includes PR #17425 MiniMax H3 context windows."""
+    try:
+        import comfy.context_windows as cw  # noqa: PLC0415
+        import comfy.model_base as mb  # noqa: PLC0415
+        import comfy_extras.nodes_minimax_h3 as nh3  # noqa: PLC0415
+        return bool(
+            hasattr(mb.BaseModel, "context_window_modality_dims")
+            and hasattr(mb.MiniMaxH3, "map_context_window_to_modalities")
+            and hasattr(cw, "IndexListContextHandler")
+            and hasattr(nh3, "video_latent_t")
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _window_latent_steps(chunk_frames_val, chunk_overlap_val):
+    """Convert pixel chunk_frames / chunk_overlap onto H3's 5n+2 latent window grid."""
+    n_len = max(2, int(round(float(chunk_frames_val) / 17.0)))
+    n_ov = max(1, min(n_len - 1, int(round(float(chunk_overlap_val) / 17.0))))
+    return n_len * 5 + 2, n_ov * 5 + 2
+
+
+def attach_context_windows(model, window_t, overlap_t, freenoise=True, factor=1):
+    """Clone `model` with ComfyUI #17425 MiniMax H3 `IndexListContextHandler`."""
+    import comfy.context_windows as cw  # noqa: PLC0415
+    m = model.clone() if hasattr(model, "clone") else model
+    if not hasattr(m, "model_options"):
+        return m
+    handler = cw.IndexListContextHandler(
+        context_schedule=cw.get_matching_context_schedule(cw.ContextSchedules.STATIC_STANDARD),
+        fuse_method=cw.get_matching_fuse_method(cw.ContextFuseMethods.PYRAMID),
+        context_length=int(window_t),
+        context_overlap=min(int(overlap_t), max(1, int(window_t) - 5)),
+        dim=2,
+        freenoise=bool(freenoise),
+        causal_window_fix=False,
+    )
+    if int(factor) > 1:
+        def _resize_strided(cond_key, cond_value, window, x_in, device, _new_item):
+            if cond_key != "minimax_payload" or not isinstance(getattr(cond_value, "cond", None), dict):
+                return None
+            kfs = cond_value.cond.get("keyframes") or []
+            strides = [int(kf.get(STRIDE_KEY, 1)) for kf in kfs]
+            if not any(s > 1 for s in strides):
+                return None
+            base_m = getattr(m, "model", None)
+            if base_m is None or not hasattr(base_m, "_window_payload"):
+                return None
+            pl = base_m._window_payload(cond_value.cond, window)
+            if len(strides) == 1 and strides[0] > 1:
+                for okf in pl.get("keyframes") or []:
+                    okf[STRIDE_KEY] = strides[0]
+            return cond_value._copy_with(pl)
+
+        handler.callbacks.setdefault(cw.IndexListCallbacks.RESIZE_COND_ITEM, []).append(_resize_strided)
+    m.model_options = dict(getattr(m, "model_options", None) or {})
+    m.model_options["context_handler"] = handler
+    cw.create_prepare_sampling_wrapper(m)
+    if freenoise:
+        cw.create_sampler_sample_wrapper(m)
+    return m
+
+
+def _single_cond_for_windows(conditioning, tv):
+    """If `conditioning` is a uniform per-chunk callable (e.g. regen2k_cond=none),
+    collapse to one conditioning for #17425 context windows; else return None."""
+    total_f = max(1, frames_in(int(tv)))
+    samples = []
+    for f in sorted({0, total_f // 3, (2 * total_f) // 3, max(0, total_f - 1)}):
+        samples.append(clean_refs(conditioning(f, min(total_f, f + 1))))
+    c0 = samples[0]
+    if not c0:
+        return c0
+    for c in samples[1:]:
+        if c is c0:
+            continue
+        if len(c) != len(c0):
+            return None
+        for (e0, d0), (e1, d1) in zip(c0, c):
+            if e0 is not e1 and (e0.shape != e1.shape or not torch.allclose(e0, e1)):
+                return None
+            if (d0.get("minimax_refs") or []) != (d1.get("minimax_refs") or []):
+                return None
+            if (d0.get("minimax_keyframes") or []) != (d1.get("minimax_keyframes") or []):
+                return None
+    return c0
+
+
 def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              denoise=DENOISE, guide=None, budget=TOKEN_BUDGET, steps=STEPS,
              start_sigma=0.0, overlap_px=TILE_OVERLAP_PX, detail_sigma=0.0,
@@ -2214,8 +2348,36 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     budget, auto_budget, budget_note = resolve_budget(budget, mem_key)
     is_regen2k = sigmas is not None
     chunking, tiling = bool(chunking), bool(tiling)
-    whole = not chunking
-    if whole:
+    eff_join = str(chunk_join)
+    windowed_active = False
+    win_t = win_ov = 0
+    if eff_join == "windowed":
+        if not _core_windows_ready():
+            print(f"[{TAG}] context windows: unavailable (core too old); falling back to stepped",
+                  flush=True)
+            eff_join = "stepped"
+        elif ic is not None or factor > 1:
+            print(f"[{TAG}] chunk_join=windowed: {'IC' if ic is not None else 'h3upscale guide'} "
+                  f"uses {'stepped' if factor <= 1 else 'crossfade'} join instead", flush=True)
+            eff_join = "stepped" if factor <= 1 else "crossfade"
+        else:
+            if per_chunk:
+                _uni = _single_cond_for_windows(conditioning, tv)
+                if _uni is None:
+                    print(f"[{TAG}] chunk_join=windowed: per-hop conditionings differ; "
+                          "falling back to stepped", flush=True)
+                    eff_join = "stepped"
+                else:
+                    cond = _uni
+                    per_chunk = False
+            if eff_join == "windowed":
+                windowed_active = True
+                win_t, win_ov = _window_latent_steps(chunk_frames, chunk_overlap)
+                print(f"[{TAG}] context windows: available (core #17425+), "
+                      f"{win_t} latent steps ({frames_in(win_t)}f), overlap "
+                      f"{win_ov} steps ({frames_in(win_ov)}f)", flush=True)
+    whole = (not chunking) or windowed_active
+    if whole and not windowed_active:
         _need = factor_seq_len(w_px, h_px, int(tv), factor)
         if _need > WHOLE_CLIP_MAX * int(budget):
             print(f"[{TAG}] chunking off: {frames_in(int(tv))} frames would be {_need} tokens "
@@ -2229,9 +2391,18 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         else:
             sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
         plan = [(0, 0, int(tv), frames_in(int(tv)))]
-        print(f"[{TAG}] chunking off: {frames_in(int(tv))} frames in one pass "
-              f"({factor_seq_len(w_px, h_px, int(tv), factor)} tokens whole-frame"
-              + ("" if tiling else ", tiling off") + ")", flush=True)
+        if windowed_active:
+            eff_win_t = min(int(tv), int(win_t))
+            exp_ta = round(frames_in(int(tv)) * FRAME_RESCALE)
+            print(f"[{TAG}] chunk_join=windowed: whole clip {frames_in(int(tv))}f in one "
+                  f"trajectory (budget basis {eff_win_t} steps = "
+                  f"{factor_seq_len(w_px, h_px, eff_win_t, factor)} tokens, "
+                  f"freenoise={'on' if str(noise) != 'film' else 'off'}, "
+                  f"audio steps {int(ta)} vs 5/3={exp_ta})", flush=True)
+        else:
+            print(f"[{TAG}] chunking off: {frames_in(int(tv))} frames in one pass "
+                  f"({factor_seq_len(w_px, h_px, int(tv), factor)} tokens whole-frame"
+                  + ("" if tiling else ", tiling off") + ")", flush=True)
     elif is_regen2k:
         sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
                   else torch.tensor(list(sigmas), dtype=torch.float32))
@@ -2244,6 +2415,9 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     else:
         sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
         plan = chunks(tv, int(chunk_frames), int(chunk_overlap))
+    if windowed_active and sigmas is not None:
+        model = attach_context_windows(
+            model, win_t, win_ov, freenoise=(str(noise) != "film"), factor=factor)
     print(f"[{TAG}] {video.shape[4] * SPATIAL}x{video.shape[3] * SPATIAL} -> "
           f"{w_px}x{h_px} ({w_px * h_px / 1048576.0:.2f} MP), {len(plan)} "
           f"chunk(s), "
@@ -2251,7 +2425,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              else "no re-draw (denoise 0)")
           + (f", h3upscale guide at {w_px // factor}x{h_px // factor}"
              if guide is not None and sigmas is not None else "")
-          + f", tile_tokens {budget_note}, attention {attn_note}, chunk_join {chunk_join}, chunking "
+          + f", tile_tokens {budget_note}, attention {attn_note}, chunk_join {eff_join}, chunking "
           f"{'on' if chunking else 'off'}, tiling {'on' if tiling else 'off'}"
           + (f", structure lock {float(structure_lock):g} ({lock_anchor})"
              if float(structure_lock) > 0.0 else "")
@@ -2333,7 +2507,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     init_budget = cur_budget = int(budget)
     mem_samples, _peak_all = [], 0
     stepped = False
-    if str(chunk_join) == "stepped" and sigmas is not None and len(plan) > 1:
+    if eff_join == "stepped" and sigmas is not None and len(plan) > 1:
         if factor > 1:
             print(f"[{TAG}] chunk_join=stepped doesn't take the h3upscale guide; "
                   "crossfading instead", flush=True)
@@ -2421,13 +2595,18 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         _tr = time.perf_counter()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+        _bt_win = min(int(cv.shape[2]), int(win_t)) if windowed_active else None
+        _rc_kw = dict(
+            detail_sigma=detail_sigma,
+            noise_video=(None if film_nv is None else film_nv[:, :, k0:k1]),
+            structure_lock=structure_lock, lock_sigma=lock_sigma,
+            anchor=lock_anchor_t, allow_tiles=tiling,
+            tile_context=tile_context,
+        )
+        if _bt_win is not None:
+            _rc_kw["budget_t"] = _bt_win
         _rc = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, int(seed), factor,
-                           cur_budget, overlap_px, detail_sigma=detail_sigma,
-                           noise_video=(None if film_nv is None
-                                        else film_nv[:, :, k0:k1]),
-                           structure_lock=structure_lock, lock_sigma=lock_sigma,
-                           anchor=lock_anchor_t, allow_tiles=tiling,
-                           tile_context=tile_context)
+                           cur_budget, overlap_px, **_rc_kw)
         rv, cur_budget = (_rc if isinstance(_rc, tuple) else (_rc, cur_budget))
         _redraw_s += time.perf_counter() - _tr
         _oom_total += _LAST_OOM[0]
@@ -2437,10 +2616,11 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
             if _LAST_OOM[0] == 0:
                 mem_samples.append((int(_LAST_TOKENS[0]), int(_pk - _res), int(_res)))
         if i == 0:
-            _, _g0 = tile_grid(int(cv.shape[3]), int(cv.shape[4]), int(cv.shape[2]),
+            _tg_t = _bt_win or int(cv.shape[2])
+            _, _g0 = tile_grid(int(cv.shape[3]), int(cv.shape[4]), _tg_t,
                                factor, cur_budget, overlap_px)
-            _tok0 = (seq_len(_g0[2], _g0[3], int(cv.shape[2])) if int(factor) <= 1
-                     else guided_seq_len(_g0[2], _g0[3], int(cv.shape[2]), factor))
+            _tok0 = (seq_len(_g0[2], _g0[3], _tg_t) if int(factor) <= 1
+                     else guided_seq_len(_g0[2], _g0[3], _tg_t, factor))
             _vram0 = (f"{torch.cuda.max_memory_allocated() / 1048576.0:.0f} MB"
                       if torch.cuda.is_available() else "0 MB")
             print(f"[{TAG}] chunk 1: peak VRAM {_vram0}, {_tok0} tokens/forward, "
@@ -2793,10 +2973,11 @@ SETTINGS_TYPE = "HTC_UPSAMPLE"
 ATTENTION_TIP = ("sparse (default) = ComfyUI's sparse attention: in side-by-side tests a "
                  "whole run was 28% faster and looked the same. dense = exact attention, "
                  "slower. A ComfyUI without sparse attention runs dense.")
-JOIN_TIP = ("How the overlapping pieces of a long clip are joined. stepped (recommended) = all "
-            "pieces are re-drawn together and agree at every step, so faces don't change at a "
-            "join. crossfade = each piece is re-drawn on its own and the overlaps are blended "
-            "(the old way; a face can shift at a join). Same speed.")
+JOIN_TIP = ("How long clips avoid seams when upscaling. stepped (recommended) = all pieces are re-drawn "
+            "together and agree at every step, so faces don't shift at a join. windowed = uses ComfyUI's "
+            "native H3 context windows (#17425) to denoise the whole clip in one seamless pyramid-fused "
+            "trajectory (bounds VRAM per window; falls back to stepped if unsupported). crossfade = each "
+            "piece is re-drawn on its own and overlaps blended.")
 CHUNKING_TIP = ("On = a long clip may be cut into overlapping pieces (about 4 s each) when it's "
                 "too much for the GPU at once. Off = the whole clip in one go: no joins, but "
                 "VRAM grows with length, so very long clips are cut anyway.")
@@ -2816,6 +2997,8 @@ CHAIN_DEFAULTS = {
     "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
     "attention": "sparse", "chunk_join": "stepped", "chunking": True, "tiling": True,
     "lock_anchor": "source", "tile_context": "none", "redraw_start": 0.6,
+    # small-face close-ups: auto = regen2k only (as before), on = ic too, off = never
+    "face_pass": "auto",
     # set by the chain node's upsample_sharpness widget, not the settings node
     "sharpness": SHARPNESS,
 }
@@ -2904,6 +3087,14 @@ class HTCUpsampleSettings:
                     "tooltip": "How much the re-draw is allowed to change. 0.6 (default) "
                                "keeps faces close to the chain's frames; 0.8 = the original "
                                "Regen2K recipe, sharper but faces drift more. Regen2K only."}),
+                # appended last: widgets_values are positional
+                "face_pass": (["auto", "on", "off"], {
+                    "default": d["face_pass"],
+                    "tooltip": "The small-face close-up re-draw after the upsample. auto = "
+                               "with Regen2K only, as before. on = also under "
+                               "upsample_redraw ic: there only faces under about 220 px, at "
+                               "most 2, drawn by Regen2K (ic keeps larger faces well and "
+                               "costs more). off = never, which saves its time."}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {

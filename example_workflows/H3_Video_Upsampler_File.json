@@ -255,7 +255,8 @@
     "source",
     true,
     "regen2k",
-    1
+    1,
+    "auto"
    ]
   },
   {

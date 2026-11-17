@@ -49,6 +49,11 @@ SCORE = 0.6             # YuNet confidence
 MAX_GAP = 12            # frames a track may go undetected (filled by interpolation)
 MIN_TRACK = 12          # detected frames a track needs
 MAX_TRACKS = 4          # faces re-drawn per clip (largest first)
+# Under the upsampler's ic method the main pass already keeps mid-size faces
+# well and costs more, so the close-ups (face_pass on) are for the small ones only:
+IC_FACE_FULL_PX = 180   # full close-up at or below this output face height
+IC_FACE_OFF_PX = 220    # none at or above it (issue #5: defects below ~220 px)
+IC_MAX_TRACKS = 2       # smallest faces first
 SMOOTH = 2.0            # box smoothing over time, frames (Gaussian sigma)
 EDGE_FADE = 6           # frames a track fades in/out at its ends
 MASK_IN, MASK_OUT = 0.55, 0.92   # oval in crop units (face half-height = 1 / CONTEXT)
@@ -212,12 +217,13 @@ def _smoothstep(a, b, x):
     return t * t * (3 - 2 * t)
 
 
-def weights(track, scale, fade_in=True, fade_out=True):
+def weights(track, scale, fade_in=True, fade_out=True, full_px=None, off_px=None):
     """Per-frame blend weight of a track's close-up re-draw: 1 for small faces,
     0 past FACE_OFF_PX, faded in/out where the track starts/ends inside the clip
     (a track that starts or ends with the clip is not faded: nothing to hand over to)."""
     s_out = track["size"] * scale
-    w = 1.0 - _smoothstep(float(FACE_FULL_PX), float(FACE_OFF_PX), s_out)
+    w = 1.0 - _smoothstep(float(FACE_FULL_PX if full_px is None else full_px),
+                          float(FACE_OFF_PX if off_px is None else off_px), s_out)
     m = w.numel()
     i = torch.arange(m, dtype=torch.float64)
     one = torch.ones(m, dtype=torch.float64)
@@ -347,14 +353,21 @@ def one_chunk(m):
     return lat_t * (CROP_OUT // 32) ** 2 <= ONE_CHUNK_TOKENS
 
 
-def select(dets, n, scale):
+def select(dets, n, scale, small_only=False):
     """Tracks worth a close-up -> jobs: {f0, m, cx, cy, side, w, size_out}, at
-    most MAX_TRACKS, largest faces first. `scale` = output px per source px."""
+    most MAX_TRACKS, largest faces first. `scale` = output px per source px.
+    small_only (under ic): the IC_* limits, at most IC_MAX_TRACKS, smallest first."""
     jobs = []
-    for tr in link(dets, n):
-        if len(jobs) >= MAX_TRACKS:
+    tracks = link(dets, n)
+    if small_only:
+        tracks = sorted(tracks, key=lambda t: float(t["size"].mean()))
+        cap, lim = IC_MAX_TRACKS, {"full_px": IC_FACE_FULL_PX, "off_px": IC_FACE_OFF_PX}
+    else:
+        cap, lim = MAX_TRACKS, {}
+    for tr in tracks:
+        if len(jobs) >= cap:
             break
-        w = weights(tr, scale, fade_in=tr["first"] > 0, fade_out=tr["last"] < n - 1)
+        w = weights(tr, scale, fade_in=tr["first"] > 0, fade_out=tr["last"] < n - 1, **lim)
         if float(w.max()) <= 0.0:
             continue
         nz = torch.nonzero(w > 0).view(-1)
@@ -424,7 +437,7 @@ def note(jobs):
     return f", {done} small face(s) re-drawn as close-ups" if done else ", no small faces"
 
 
-def apply(img, images, redraw_fn, fps=24.0):
+def apply(img, images, redraw_fn, fps=24.0, small_only=False):
     """Re-draw the small faces of `images` (the source, [n, h, w, 3]) as close-ups
     and blend them into `img` (the upsampled clip, [n, Ho, Wo, 3]) in place.
 
@@ -440,7 +453,7 @@ def apply(img, images, redraw_fn, fps=24.0):
     dets = detect(images[:n])
     if dets is None:
         return img, ""
-    jobs = select(dets, n, (sx + sy) / 2.0)
+    jobs = select(dets, n, (sx + sy) / 2.0, small_only=small_only)
     if not jobs:
         return img, note(jobs)
     crops = crops_from_batches(jobs, (images[s:s + 64] for s in range(0, n, 64)))

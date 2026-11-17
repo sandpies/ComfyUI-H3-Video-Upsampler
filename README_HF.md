@@ -71,7 +71,7 @@ Hover any setting in ComfyUI for a short explanation. The ones you might change:
 |---|---|
 | `megapixels` | Output size. **2** is about 1080p. It must be bigger than your clip. |
 | `redraw_steps` | **3** is the normal recipe. **2** is a third faster and looked the same in our tests. |
-| `redraw_start` | How much the re-draw may change (`regen2k` only). **0.6** keeps faces close; 0.8 is sharper but faces can change. |
+| `redraw_start` | How much the re-draw may change (`regen2k`; under `ic` the face close-ups only). **0.6** keeps faces close; 0.8 is sharper but faces can change. |
 | `denoise` | **0** only enlarges, with no re-draw. |
 | `sharpness` | Only with the 2D latent upscaler: **1** stays closest to your clip, **6** is sharpest. The 3D upscaler ignores it. |
 | `conditioning` | Optional text describing the look, e.g. *"2D anime, flat cel shading"*. Helps animation. |
@@ -98,7 +98,10 @@ Leave the rest at their defaults: they adjust themselves to your graphics card.
   further, automatically.
 - **Small faces in the distance** get their own close-up re-draw automatically
   (`regen2k`; `ic` keeps faces from your clip anyway). It needs OpenCV, which most
-  ComfyUI installs have.
+  ComfyUI installs have. `face_pass`: `auto` (that), `on` (also under `ic`: only
+  faces under about 220 px, at most 2, drawn by Regen2K), `off` (skip it, faster).
+- **Log warns the soundtrack and the clip disagree on length?** Wire `fps` from the
+  video: the clip is probably not 24 fps.
 - **Anime getting extra lines?** Add a `conditioning` prompt describing the look.
 - **Log says `dense (ComfyUI-KJNodes is too old for sparse attention: update it)`?**
   The run still works, just slower. Update ComfyUI-KJNodes to get sparse attention back.
@@ -110,4 +113,5 @@ whole chain. Latent upscaler network: LBH-123-AI. Upscale recipe: bbaudio-2025's
 MMH3 Ultimate Upscale. Open-H3-Regenerate-2K and Regenerate-2K-IC: NVlabs
 (`Efficient-Large-Model`); IC LoRA resize and core's H3 latent upscaler: Kijai.
 HyperFlow: videorebirth. LMS Sharp and the guide layout: Alissonerdx. Face detector:
-YuNet (Shiqi Yu, opencv_zoo). See `THIRD_PARTY_NOTICES.md`.
+YuNet (Shiqi Yu, opencv_zoo). Audio-end fix: plz12345. Small-face pass under `ic`:
+requested by Airsiren. See `THIRD_PARTY_NOTICES.md`.
