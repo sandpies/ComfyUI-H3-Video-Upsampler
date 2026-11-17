@@ -114,14 +114,39 @@ def fit_frames(images, w, h):
 
 
 def slice_audio(audio, t0, t1):
-    """The part of an AUDIO dict from t0 to t1 seconds (None stays None)."""
+    """The part of an AUDIO dict from t0 to t1 seconds, silence-padded past its end
+    (None stays None)."""
     if audio is None:
         return None
     sr = int(audio["sample_rate"])
     wav = audio["waveform"]
     a, b = max(0, int(round(t0 * sr))), max(0, int(round(t1 * sr)))
-    return {"waveform": wav[..., a:max(a + 1, b)], "sample_rate": sr}
+    b = max(a + 1, b)
+    out = wav[..., a:b]
+    if int(out.shape[-1]) < b - a:
+        # the span runs past the soundtrack's end (audio shorter than the video):
+        # pad with silence, or the audio VAE gets a few samples and its conv fails
+        pad = torch.zeros(out.shape[:-1] + (b - a - int(out.shape[-1]),),
+                          dtype=wav.dtype, device=wav.device)
+        out = torch.cat([out, pad], dim=-1)
+    return {"waveform": out, "sample_rate": sr}
 
+
+def check_audio_length(audio, n_frames, fps):
+    """Warn when the soundtrack and the clip disagree on length at `fps`: the usual
+    cause is an unwired fps on a clip that isn't 24 fps, which puts the soundtrack
+    out of sync and sends late close-ups past its end."""
+    if audio is None:
+        return
+    a_s = int(audio["waveform"].shape[-1]) / float(audio["sample_rate"])
+    clip_fps = float(fps) if fps else float(H3_FPS)
+    v_s = n_frames / clip_fps
+    if a_s <= 0 or abs(v_s - a_s) / max(v_s, a_s) <= 0.05:
+        return
+    print(f"[{TAG}] warning: {n_frames} frames at {clip_fps:g} fps is {v_s:.2f} s but the "
+          f"soundtrack is {a_s:.2f} s" + (
+              f"; the clip may be {n_frames / a_s:.3g} fps, wire fps from the video"
+              if not fps else ""), flush=True)
 
 def pad_frames(images, length):
     """Repeat the last frame up to `length` (the VAE pads a short clip the same way)."""
@@ -589,6 +614,7 @@ class HTCVideoUpsampler:
         n = int(images.shape[0])
         if n < 1:
             raise ValueError(f"{TAG}: no frames")
+        check_audio_length(audio, n, fps)
         src_w, src_h = int(images.shape[2]), int(images.shape[1])
         w, h = grid_size(src_w, src_h)
         length = valid_length(n)
