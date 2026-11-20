@@ -81,6 +81,95 @@ _LAST_OOM = [0]            # OOM retries in the most recent redraw_chunk call (l
 _LAST_BUDGET = [TOKEN_BUDGET]  # budget redraw_chunk / upsample finished at
 _LAST_TOKENS = [0]          # tokens per forward of the last redraw_chunk grid (incl. cond rows)
 
+# --- the node's progress bar -------------------------------------------------
+#
+# One bar for the whole re-draw: sampler steps done out of the steps planned.
+# sample_tile used to open a ProgressBar per call, and a stepped tile is a
+# one-step call, so the node read 100% from the first tile to the last
+# (issue #7). upsample() plans the steps before it samples (progress_expect),
+# squares the plan with what each chunk really took (progress_settle), and an
+# OOM retry winds the count back to where the retried work began.
+_PROG = {"bar": None, "done": 0, "total": 0, "owner": None}
+
+
+def _progress_owner():
+    """(prompt id, node id) of the node running now, or None (older ComfyUI)."""
+    try:
+        from comfy_execution.utils import get_executing_context  # noqa: PLC0415
+        ctx = get_executing_context()
+        return None if ctx is None else (ctx.prompt_id, ctx.node_id)
+    except Exception:
+        return None
+
+
+def _progress_show(preview=None):
+    p = _PROG
+    if p["bar"] is not None:
+        p["bar"].update_absolute(min(p["done"], p["total"]), max(1, p["total"]), preview)
+
+
+def progress_active():
+    p = _PROG
+    return p["bar"] is not None and p["total"] > 0 and p["owner"] == _progress_owner()
+
+
+def progress_expect(n):
+    """`n` more sampler steps to come. A new run, or a bar whose plan is all
+    done (the face pass after the main re-draw, the next hop of a chain),
+    starts a fresh bar at 0."""
+    import comfy.utils  # noqa: PLC0415
+    n = int(n)
+    if n <= 0:
+        return
+    p, owner = _PROG, _progress_owner()
+    if p["bar"] is None or p["done"] >= p["total"] or p["owner"] != owner:
+        p.update(bar=comfy.utils.ProgressBar(n), done=0, total=0, owner=owner)
+    p["total"] += n
+    _progress_show()
+
+
+def progress_mark():
+    return _PROG["done"]
+
+
+def progress_rewind(mark):
+    """An OOM retry redoes the work since `mark`: count it once."""
+    if _PROG["bar"] is not None and _PROG["done"] > mark:
+        _PROG["done"] = int(mark)
+        _progress_show()
+
+
+def progress_settle(mark, planned):
+    """The work since `mark` was planned as `planned` steps: swap the plan for
+    what it took (more tiles after an OOM, a skipped global pass)."""
+    p = _PROG
+    if p["bar"] is not None:
+        p["total"] = max(p["done"], p["total"] + (p["done"] - int(mark)) - int(planned))
+        _progress_show()
+
+
+def _progress_step(preview=None):
+    # The total moves only in progress_expect/settle: a chunk that runs past its
+    # plan holds at 100% until settle counts the overrun once.
+    _PROG["done"] += 1
+    _progress_show(preview)
+
+
+def chunk_steps(cv, t, n_steps, factor=1, budget=None, overlap_px=TILE_OVERLAP_PX,
+                tile_context="none"):
+    """Sampler steps one chunk's re-draw will take, as redraw_chunk /
+    redraw_stepped grid it (cond rows left out; progress_settle squares it).
+    `budget` None = whole-frame."""
+    k = 1
+    if budget is not None:
+        try:
+            k = len(tile_grid(int(cv.shape[3]), int(cv.shape[4]), int(t), factor,
+                              max(4096, int(budget)), overlap_px)[0])
+        except Exception:
+            k = 1
+    glob = k > 1 and int(factor) <= 1 and str(tile_context) == "global pass"
+    return int(n_steps) * (k + (1 if glob else 0))
+
 
 class _DefaultInt(int):
     """Sentinel int equal to CHUNK_FRAMES that marks an un-overridden default."""
@@ -1612,8 +1701,25 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=No
         # On the guider's own options, not a model clone: the DiT stays staged.
         guider.model_options = mp.set_model_options_post_cfg_function(
             mp.create_model_options_clone(guider.model_options), lock)
-    callback = latent_preview.prepare_callback(
-        guider.model_patcher, sigmas.shape[-1] - 1, {})
+    if progress_active():
+        # The node's one bar (see _PROG), with the same x0 preview.
+        try:
+            previewer = latent_preview.get_previewer(
+                guider.model_patcher.load_device, guider.model_patcher.model.latent_format)
+        except Exception:
+            previewer = None
+
+        def callback(step, x0, x, total_steps):
+            preview = None
+            if previewer:
+                try:
+                    preview = previewer.decode_latent_to_preview_image("JPEG", x0)
+                except Exception:
+                    preview = None
+            _progress_step(preview)
+    else:
+        callback = latent_preview.prepare_callback(
+            guider.model_patcher, sigmas.shape[-1] - 1, {})
     _ts = time.perf_counter()
     out = guider.sample(nt.NestedTensor(noise), samples, sampler, sigmas,
                         denoise_mask=mask, callback=callback,
@@ -1843,6 +1949,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     cur_budget = int(budget)
     _oom_retries = 0
     _LAST_OOM[0] = 0
+    _pm = progress_mark()
 
     extra = _cond_extra_tokens(cond)
     lock_src = video if anchor is None else anchor.to(device=video.device, dtype=video.dtype)
@@ -1959,6 +2066,7 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                   f"lowering tile budget to {next_budget} (more, smaller tiles) and retrying chunk...",
                   flush=True)
             _free_all_gpu()
+            progress_rewind(_pm)
             cur_budget = next_budget
 
     if float(detail_sigma or 0.0) > 0.0:
@@ -2507,6 +2615,13 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     init_budget = cur_budget = int(budget)
     mem_samples, _peak_all = [], 0
     stepped = False
+    est = [0] * len(plan)
+    if sigmas is not None:
+        for i, (k0, _f0, k1, _f1) in enumerate(plan):
+            _t = min(k1 - k0, int(win_t)) if windowed_active else k1 - k0
+            est[i] = chunk_steps(upscaled_cvs[i], _t, len(sigmas) - 1, factor,
+                                 cur_budget if tiling else None, overlap_px, tile_context)
+        progress_expect(sum(est))
     if eff_join == "stepped" and sigmas is not None and len(plan) > 1:
         if factor > 1:
             print(f"[{TAG}] chunk_join=stepped doesn't take the h3upscale guide; "
@@ -2520,6 +2635,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                 conds.append(cond_for_chunk(clean_refs(conditioning(f0, f1)) if per_chunk
                                             else cond, f0, f1, cv.shape[3], cv.shape[4]))
             _tr = time.perf_counter()
+            _pm = progress_mark()
             while True:
                 try:
                     out_v, s_notes = redraw_stepped(
@@ -2535,6 +2651,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                         raise
                     _free_all_gpu()
                     mem_samples.clear()
+                    progress_rewind(_pm)
                     nb = max(16384, int(cur_budget * 0.65))
                     if tiling and nb < cur_budget:
                         _oom_total += 1
@@ -2548,6 +2665,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                     break
             _redraw_s += time.perf_counter() - _tr
             if stepped:
+                progress_settle(_pm, sum(est))
                 for _n in s_notes:
                     print(f"[{TAG}] chunk_join=stepped: {_n}", flush=True)
                 print(f"[{TAG}] chunk_join=stepped: re-draw {_redraw_s:.1f} s", flush=True)
@@ -2605,8 +2723,10 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         )
         if _bt_win is not None:
             _rc_kw["budget_t"] = _bt_win
+        _pm = progress_mark()
         _rc = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, int(seed), factor,
                            cur_budget, overlap_px, **_rc_kw)
+        progress_settle(_pm, est[i])
         rv, cur_budget = (_rc if isinstance(_rc, tuple) else (_rc, cur_budget))
         _redraw_s += time.perf_counter() - _tr
         _oom_total += _LAST_OOM[0]
