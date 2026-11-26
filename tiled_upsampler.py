@@ -45,6 +45,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from comfy_api.latest import io
 
 TAG = "H3VideoUpsampler"
 
@@ -3032,44 +3033,10 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
     return frames, note
 
 
-class HTCTiledUpsampler:
+class _HTCTiledUpsamplerImpl:
     """A finished H3 clip upscaled in latent space and lightly re-drawn in
     tiles, then decoded."""
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL", {"tooltip": "The H3 model the clip was made with."}),
-                "conditioning": ("CONDITIONING", {
-                    "tooltip": "The conditioning the clip was made with."}),
-                "latent": ("LATENT", {"tooltip": "The finished H3 AV latent."}),
-                "sampler": ("SAMPLER", {"tooltip": "The sampler for the light re-draw."}),
-                "vae": ("VAE", {"tooltip": "The H3 video VAE."}),
-                "audio_vae": ("VAE", {"tooltip": "The H3 audio VAE."}),
-                "upscale_model": (choices(), {
-                    "tooltip": "From models/latent_upscale_models. The recipe uses "
-                               f"{UPSCALER_FILE} (3D); {UPSCALER_2D_FILE} (2D) also "
-                               "loads and takes sharpness."}),
-                "megapixels": ("FLOAT", {
-                    "default": MEGAPIXELS, "min": 0.1, "max": 16.0, "step": 0.05,
-                    "tooltip": "Output size as area, aspect kept (1 MP = 1024x1024). "
-                               "1.5-2 is the usual range."}),
-                # appended last: widgets_values are positional
-                "sharpness": ("INT", {
-                    "default": SHARPNESS, "min": 1, "max": SHARPNESS_MAX, "step": 1,
-                    "tooltip": SHARPNESS_TIP}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    FUNCTION = "run"
-    CATEGORY = "Hand Tie Clips"
-    DESCRIPTION = (
-        "Makes a finished MiniMax H3 clip bigger and sharper: the H3 latent "
-        "upscaler per time chunk, then one light re-draw step in tiles that are "
-        "stepped together, so there are no tile seams. The recipe is fixed; "
-        "only the size is a widget.")
 
     def run(self, model, conditioning, latent, sampler, vae, audio_vae,
             upscale_model, megapixels, sharpness=SHARPNESS):
@@ -3079,6 +3046,72 @@ class HTCTiledUpsampler:
                        float(megapixels), sharpness=int(sharpness))
         images = nodes.VAEDecode().decode(vae, out)[0]
         return (images, vae_decode_audio(audio_vae, out))
+
+
+class HTCTiledUpsampler(io.ComfyNode, _HTCTiledUpsamplerImpl):
+    """V3 schema for HTCTiledUpsampler; the implementation lives in _HTCTiledUpsamplerImpl.
+
+    Also inherits _HTCTiledUpsamplerImpl so existing callers of the V1 API (HTCTiledUpsampler().run(...),
+    HTCTiledUpsampler.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='HTCTiledUpsampler',
+            display_name='H3 Tiled Upsampler',
+            category="Hand Tie Clips",
+            description="Makes a finished MiniMax H3 clip bigger and sharper: the H3 latent "
+                "upscaler per time chunk, then one light re-draw step in tiles that are "
+                "stepped together, so there are no tile seams. The recipe is fixed; "
+                "only the size is a widget.",
+            inputs=[
+                io.Model.Input('model', tooltip="The H3 model the clip was made with."),
+                io.Conditioning.Input(
+                    'conditioning',
+                    tooltip="The conditioning the clip was made with.",
+                ),
+                io.Latent.Input('latent', tooltip="The finished H3 AV latent."),
+                io.Sampler.Input('sampler', tooltip="The sampler for the light re-draw."),
+                io.Vae.Input('vae', tooltip="The H3 video VAE."),
+                io.Vae.Input('audio_vae', tooltip="The H3 audio VAE."),
+                io.Combo.Input(
+                    'upscale_model',
+                    options=choices(),
+                    tooltip="From models/latent_upscale_models. The recipe uses "
+                               f"{UPSCALER_FILE} (3D); {UPSCALER_2D_FILE} (2D) also "
+                               "loads and takes sharpness.",
+                ),
+                io.Float.Input(
+                    'megapixels',
+                    default=MEGAPIXELS,
+                    min=0.1,
+                    max=16.0,
+                    step=0.05,
+                    tooltip="Output size as area, aspect kept (1 MP = 1024x1024). "
+                               "1.5-2 is the usual range.",
+                ),
+                # appended last: widgets_values are positional
+                io.Int.Input(
+                    'sharpness',
+                    default=SHARPNESS,
+                    min=1,
+                    max=SHARPNESS_MAX,
+                    step=1,
+                    tooltip=SHARPNESS_TIP,
+                ),
+            ],
+            outputs=[
+                io.Image.Output(),
+                io.Audio.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        result = _HTCTiledUpsamplerImpl().run(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
 
 
 # --- the chain's upsample settings -------------------------------------------
@@ -3136,99 +3169,9 @@ def resolve_settings(settings):
     return out
 
 
-class HTCUpsampleSettings:
+class _HTCUpsampleSettingsImpl:
     """Every setting of the chain's upsample, for HandTieClips' upsample_settings."""
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        d = CHAIN_DEFAULTS
-        return {
-            "required": {
-                "steps": ("INT", {
-                    "default": 3, "min": 1, "max": 8,
-                    "tooltip": "Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
-                               "Regen2K it looked the same in side-by-side tests, for "
-                               "upsample_redraw ic it starts later, so less is re-drawn."}),
-                "start_sigma": ("FLOAT", {
-                    "default": d["start_sigma"], "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": ("Leave at 0 (the Regen2K recipe; redraw_start sets how much "
-                                "changes). Above 0: the older recipe, re-drawing from this noise "
-                                "level.")}),
-                "noise": (["per_chunk", "film"], {
-                    "default": "per_chunk",
-                    "tooltip": "per_chunk = each piece gets its own noise (Regen2K default). "
-                               "film = one noise pattern across the whole film."}),
-                # Not named seed: ComfyUI hangs a randomize control on any
-                # widget called seed, and the seed must stay fixed.
-                "redraw_seed": ("INT", {
-                    "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
-                    "tooltip": "Noise seed for the re-draw. Same seed, same result."}),
-                "chunk_frames": ("INT", {
-                    "default": int(d["chunk_frames"]), "min": 34, "max": 1020, "step": 17,
-                    "tooltip": "Frames per piece (a multiple of 17). Longer = fewer joins "
-                               "but more VRAM. Regen2K never goes under 68."}),
-                "chunk_overlap": ("INT", {
-                    "default": d["chunk_overlap"], "min": 17, "max": 1003, "step": 17,
-                    "tooltip": "Frames two neighbouring pieces share (a multiple of 17, less "
-                               "than chunk_frames)."}),
-                "anchor_strength": ("FLOAT", {
-                    "default": d["anchor_strength"], "min": 0.0, "max": 1.0, "step": 0.001,
-                    "tooltip": "Pre-Regen2K recipe only: how firmly each piece's first frame "
-                               "follows the previous piece. 0.999 = H3's default."}),
-                "tile_overlap_px": ("INT", {
-                    "default": d["tile_overlap_px"], "min": 0, "max": 512, "step": 32,
-                    "tooltip": "How much neighbouring tiles overlap, in pixels (128 = normal). "
-                               "Only matters when frames are cut into tiles."}),
-                "detail_sigma": ("FLOAT", {
-                    "default": d["detail_sigma"], "min": 0.0, "max": 32.0, "step": 0.5,
-                    "tooltip": "0 = off. Above 0, keeps the upscaler's large shapes and takes "
-                               "only fine detail from the re-draw. A fix for tile-grid "
-                               "shifts, not a sharpness control."}),
-                "attn_chunks": ("INT", {
-                    "default": d["attn_chunks"], "min": 1, "max": 16,
-                    "tooltip": "VRAM saver; same result either way. Keep 4: lower needs far "
-                               "more VRAM and can stall the PC."}),
-                "ffn_chunks": ("INT", {
-                    "default": d["ffn_chunks"], "min": 1, "max": 16,
-                    "tooltip": "VRAM saver; same result either way. Keep 2, or raise it on "
-                               "smaller cards."}),
-                "attention": (list(ATTENTION_MODES), {
-                    "default": d["attention"],
-                    "tooltip": ATTENTION_TIP}),
-                "chunk_join": (list(JOIN_MODES), {
-                    "default": d["chunk_join"],
-                    "tooltip": JOIN_TIP}),
-                "chunking": ("BOOLEAN", {
-                    "default": d["chunking"], "tooltip": CHUNKING_TIP}),
-                "tiling": ("BOOLEAN", {
-                    "default": d["tiling"], "tooltip": TILING_TIP}),
-                "redraw_start": ("FLOAT", {
-                    "default": d["redraw_start"], "min": 0.3, "max": 0.95, "step": 0.05,
-                    "tooltip": "How much the re-draw is allowed to change. 0.6 (default) "
-                               "keeps faces close to the chain's frames; 0.8 = the original "
-                               "Regen2K recipe, sharper but faces drift more. Regen2K only."}),
-                # appended last: widgets_values are positional
-                "face_pass": (["auto", "on", "off"], {
-                    "default": d["face_pass"],
-                    "tooltip": "The small-face close-up re-draw after the upsample. auto = "
-                               "with Regen2K only, as before. on = also under "
-                               "upsample_redraw ic: there only faces under about 220 px, at "
-                               "most 2, drawn by Regen2K (ic keeps larger faces well and "
-                               "costs more). off = never, which saves its time."}),
-            },
-            "optional": {
-                "sampler": ("SAMPLER", {
-                    "tooltip": "Optional sampler for the re-draw. Unwired = euler, which "
-                               "Regen2K is tuned for."}),
-            },
-        }
-
-    RETURN_TYPES = (SETTINGS_TYPE,)
-    RETURN_NAMES = ("upsample_settings",)
-    FUNCTION = "build"
-    CATEGORY = "Hand Tie Clips"
-    DESCRIPTION = ("Settings for HandTieClips' upsample. Wire into its upsample_settings "
-                   "socket; unwired, the chain uses these defaults.")
 
     def build(self, sampler=None, **kw):
         out = dict(kw)
@@ -3238,6 +3181,174 @@ class HTCUpsampleSettings:
         out["sampler"] = sampler
         resolve_settings(out)
         return (out,)
+
+
+class HTCUpsampleSettings(io.ComfyNode, _HTCUpsampleSettingsImpl):
+    """V3 schema for HTCUpsampleSettings; the implementation lives in _HTCUpsampleSettingsImpl.
+
+    Also inherits _HTCUpsampleSettingsImpl so existing callers of the V1 API (HTCUpsampleSettings().build(...),
+    HTCUpsampleSettings.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        d = CHAIN_DEFAULTS
+        return io.Schema(
+            node_id='HTCUpsampleSettings',
+            display_name='HTC Upsample Settings',
+            category="Hand Tie Clips",
+            description="Settings for HandTieClips' upsample. Wire into its upsample_settings "
+                "socket; unwired, the chain uses these defaults.",
+            inputs=[
+                io.Int.Input(
+                    'steps',
+                    default=3,
+                    min=1,
+                    max=8,
+                    tooltip="Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
+                               "Regen2K it looked the same in side-by-side tests, for "
+                               "upsample_redraw ic it starts later, so less is re-drawn.",
+                ),
+                io.Float.Input(
+                    'start_sigma',
+                    default=d["start_sigma"],
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip="Leave at 0 (the Regen2K recipe; redraw_start sets how much "
+                                "changes). Above 0: the older recipe, re-drawing from this noise "
+                                "level.",
+                ),
+                io.Combo.Input(
+                    'noise',
+                    options=["per_chunk", "film"],
+                    default="per_chunk",
+                    tooltip="per_chunk = each piece gets its own noise (Regen2K default). "
+                               "film = one noise pattern across the whole film.",
+                ),
+                # Not named seed: ComfyUI hangs a randomize control on any
+                # widget called seed, and the seed must stay fixed.
+                io.Int.Input(
+                    'redraw_seed',
+                    default=REGEN2K_SEED,
+                    min=0,
+                    max=0x7FFFFFFF,
+                    tooltip="Noise seed for the re-draw. Same seed, same result.",
+                ),
+                io.Int.Input(
+                    'chunk_frames',
+                    default=int(d["chunk_frames"]),
+                    min=34,
+                    max=1020,
+                    step=17,
+                    tooltip="Frames per piece (a multiple of 17). Longer = fewer joins "
+                               "but more VRAM. Regen2K never goes under 68.",
+                ),
+                io.Int.Input(
+                    'chunk_overlap',
+                    default=d["chunk_overlap"],
+                    min=17,
+                    max=1003,
+                    step=17,
+                    tooltip="Frames two neighbouring pieces share (a multiple of 17, less "
+                               "than chunk_frames).",
+                ),
+                io.Float.Input(
+                    'anchor_strength',
+                    default=d["anchor_strength"],
+                    min=0.0,
+                    max=1.0,
+                    step=0.001,
+                    tooltip="Pre-Regen2K recipe only: how firmly each piece's first frame "
+                               "follows the previous piece. 0.999 = H3's default.",
+                ),
+                io.Int.Input(
+                    'tile_overlap_px',
+                    default=d["tile_overlap_px"],
+                    min=0,
+                    max=512,
+                    step=32,
+                    tooltip="How much neighbouring tiles overlap, in pixels (128 = normal). "
+                               "Only matters when frames are cut into tiles.",
+                ),
+                io.Float.Input(
+                    'detail_sigma',
+                    default=d["detail_sigma"],
+                    min=0.0,
+                    max=32.0,
+                    step=0.5,
+                    tooltip="0 = off. Above 0, keeps the upscaler's large shapes and takes "
+                               "only fine detail from the re-draw. A fix for tile-grid "
+                               "shifts, not a sharpness control.",
+                ),
+                io.Int.Input(
+                    'attn_chunks',
+                    default=d["attn_chunks"],
+                    min=1,
+                    max=16,
+                    tooltip="VRAM saver; same result either way. Keep 4: lower needs far "
+                               "more VRAM and can stall the PC.",
+                ),
+                io.Int.Input(
+                    'ffn_chunks',
+                    default=d["ffn_chunks"],
+                    min=1,
+                    max=16,
+                    tooltip="VRAM saver; same result either way. Keep 2, or raise it on "
+                               "smaller cards.",
+                ),
+                io.Combo.Input(
+                    'attention',
+                    options=list(ATTENTION_MODES),
+                    default=d["attention"],
+                    tooltip=ATTENTION_TIP,
+                ),
+                io.Combo.Input(
+                    'chunk_join',
+                    options=list(JOIN_MODES),
+                    default=d["chunk_join"],
+                    tooltip=JOIN_TIP,
+                ),
+                io.Boolean.Input('chunking', default=d["chunking"], tooltip=CHUNKING_TIP),
+                io.Boolean.Input('tiling', default=d["tiling"], tooltip=TILING_TIP),
+                io.Float.Input(
+                    'redraw_start',
+                    default=d["redraw_start"],
+                    min=0.3,
+                    max=0.95,
+                    step=0.05,
+                    tooltip="How much the re-draw is allowed to change. 0.6 (default) "
+                               "keeps faces close to the chain's frames; 0.8 = the original "
+                               "Regen2K recipe, sharper but faces drift more. Regen2K only.",
+                ),
+                # appended last: widgets_values are positional
+                io.Combo.Input(
+                    'face_pass',
+                    options=["auto", "on", "off"],
+                    default=d["face_pass"],
+                    tooltip="The small-face close-up re-draw after the upsample. auto = "
+                               "with Regen2K only, as before. on = also under "
+                               "upsample_redraw ic: there only faces under about 220 px, at "
+                               "most 2, drawn by Regen2K (ic keeps larger faces well and "
+                               "costs more). off = never, which saves its time.",
+                ),
+                io.Sampler.Input(
+                    'sampler',
+                    optional=True,
+                    tooltip="Optional sampler for the re-draw. Unwired = euler, which "
+                               "Regen2K is tuned for.",
+                ),
+            ],
+            outputs=[
+                io.Custom('HTC_UPSAMPLE').Output(display_name='upsample_settings'),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        result = _HTCUpsampleSettingsImpl().build(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
 
 
 NODE_CLASS_MAPPINGS = {"HTCTiledUpsampler": HTCTiledUpsampler,

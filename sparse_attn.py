@@ -27,6 +27,7 @@ import re
 import weakref
 
 import torch
+from comfy_api.latest import io
 
 TAG = "HTCSparseAttention"
 _LOG = logging.getLogger(TAG)
@@ -1076,132 +1077,9 @@ def apply_chunk_ffn(model, chunks: int = 2, seq_threshold: int = 4096):
     return m
 
 
-class HTCSparseAttention:
+class _HTCSparseAttentionImpl:
     """Built-in MIT MiniMax-H3 Sparse / Low-VRAM Attention (Comfy Kitchen SLA / Sol-Attn / VSA)."""
 
-    CATEGORY = "Hand Tie Clips"
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "apply"
-    DESCRIPTION = (
-        "Clean-room MIT MiniMax-H3 sparse attention on Comfy Kitchen (`ck.sol_attn_chunked` + `sol_attn`), "
-        "combining streaming 4096-row QKV projection, pooled-tail compensation, exact prefix protection, "
-        "step annealing, and head-chunked low-VRAM dense fallback. Chains safely with HTCSteeringDials, "
-        "HTCTokenLoRA, and HandTieClips's built-in cache with zero external dependencies."
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL", {
-                    "tooltip": "MiniMax-H3 model to accelerate with SLA+ / Sol-Attn sparse attention.",
-                }),
-                "preset": (list(PRESETS), {
-                    "default": PRESETS[0],
-                    "tooltip": (
-                        "Quick attention preset (overrides manual settings below except manual): "
-                        "turbo_sla_balanced = best 4-8 step Turbo speed/quality balance (20% keep + step 0/last dense); "
-                        "turbo_sla_quality = higher 30% keep + first 25% steps dense; "
-                        "turbo_sla_fast = lighter 14%->20% keep for max speed; "
-                        "native_sol_balanced / quality = training-free sparse attention for base (non-Turbo) H3 checkpoints; "
-                        "vsa_10 = FastH3 3D block sparse (10% keep); "
-                        "dense_low_vram = exact dense attention split into 4 head chunks; "
-                        "manual = use all individual sliders below."
-                    ),
-                }),
-            },
-            "optional": {
-                "method": (list(METHODS), {
-                    "default": "sla",
-                    "tooltip": (
-                        "Manual only. Sparse attention algorithm: "
-                        "sla = token-level importance keep + pooled tail compensation; "
-                        "vsa = 3D spatial-temporal cube sparse (VSA); "
-                        "dense = exact dense attention."
-                    ),
-                }),
-                "keep_percent": ("FLOAT", {
-                    "default": 20.0, "min": 0.5, "max": 95.0, "step": 0.5,
-                    "tooltip": "Manual only. Percentage of key/value blocks each query attends to (higher = closer to dense, slower).",
-                }),
-                "keep_percent_end": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 95.0, "step": 0.5,
-                    "tooltip": "Manual only. End keep_percent at the final step when annealing across sampling (-1 = fixed at keep_percent).",
-                }),
-                "tau": ("FLOAT", {
-                    "default": 1.35, "min": 0.0, "max": 4.0, "step": 0.05,
-                    "tooltip": "Manual only. Temperature/sharpness of sparse block importance scores (0 = uniform, ~1.35 = balanced).",
-                }),
-                "tau_end": ("FLOAT", {
-                    "default": -1.0, "min": -1.0, "max": 4.0, "step": 0.05,
-                    "tooltip": "Manual only. End tau at the final step when annealing (-1 = fixed at tau).",
-                }),
-                "tail": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Manual only. Add pooled summary of unselected tail tokens so distant context is never silently dropped.",
-                }),
-                "extra_tokens": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "step": 64,
-                    "tooltip": "Manual only. Extra learned/augmented sink tokens per block (0 = training-free, recommended).",
-                }),
-                "sink_mode": (list(SINK_MODES), {
-                    "default": SINK_MODES[0],
-                    "tooltip": (
-                        "Which conditioning prefix rows always receive exact dense attention: "
-                        "exact_prefix_rows (protect text/ref/audio sinks), exact_kv, exact_kv_and_rows, or off."
-                    ),
-                }),
-                "dense_first_steps": ("INT", {
-                    "default": 1, "min": 0, "max": 32, "step": 1,
-                    "tooltip": "Manual only. Run this many opening denoising steps in exact dense attention to lock early layout.",
-                }),
-                "dense_first_percent": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Manual only. Run this fraction of early steps dense (0 = rely on dense_first_steps).",
-                }),
-                "dense_last_steps": ("INT", {
-                    "default": 1, "min": 0, "max": 16, "step": 1,
-                    "tooltip": "Manual only. Run this many final steps dense to keep fine skin, lips, and edge detail sharp.",
-                }),
-                "dense_layers": ("STRING", {
-                    "default": "0", "multiline": False,
-                    "tooltip": "Manual only. Comma/range list of block indices forced to dense attention (e.g. '0' or '0-2,49').",
-                }),
-                "min_tokens": ("INT", {
-                    "default": 12288, "min": 0, "max": 1 << 20, "step": 512,
-                    "tooltip": "Manual only. Fall back cleanly to dense below this token count (short clips get zero speedup overhead).",
-                }),
-                "chunked_qkv": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Manual only. Stream QKV projection in 4096-row chunks directly into sol_attn_chunked (saves substantial VRAM).",
-                }),
-                "dense_head_chunks": ("INT", {
-                    "default": 1, "min": 1, "max": 8, "step": 1,
-                    "tooltip": "Manual only. Split dense fallback attention across this many head chunks (4 cuts peak VRAM on small GPUs).",
-                }),
-                "dense_backend": (list(DENSE_BACKENDS), {
-                    "default": DENSE_BACKENDS[0],
-                    "tooltip": "Manual only. Backend used on dense steps (comfy_kitchen_int8, comfy_kitchen, or torch_sdpa).",
-                }),
-                "disable_fp16_accum": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Disable reduced-precision fp16/bf16 matmul accumulation during H3 steps for cleaner color & seam accuracy.",
-                }),
-                "start_percent": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Sampling progress [0..1] where sparse attention becomes active (steps before this stay dense).",
-                }),
-                "end_percent": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Sampling progress [0..1] where sparse attention stops (steps after this return to dense).",
-                }),
-                "verbose": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Log per-step sparse vs dense attention calls to the ComfyUI console.",
-                }),
-            },
-        }
 
     def apply(
         self,
@@ -1253,6 +1131,218 @@ class HTCSparseAttention:
             verbose=verbose,
         )
         return (patched,)
+
+
+class HTCSparseAttention(io.ComfyNode, _HTCSparseAttentionImpl):
+    """V3 schema for HTCSparseAttention; the implementation lives in _HTCSparseAttentionImpl.
+
+    Also inherits _HTCSparseAttentionImpl so existing callers of the V1 API (HTCSparseAttention().apply(...),
+    HTCSparseAttention.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='HTCSparseAttention',
+            display_name='HTC Sparse Attention / SLA+ (H3)',
+            category="Hand Tie Clips",
+            description="Clean-room MIT MiniMax-H3 sparse attention on Comfy Kitchen (`ck.sol_attn_chunked` + `sol_attn`), "
+                "combining streaming 4096-row QKV projection, pooled-tail compensation, exact prefix protection, "
+                "step annealing, and head-chunked low-VRAM dense fallback. Chains safely with HTCSteeringDials, "
+                "HTCTokenLoRA, and HandTieClips's built-in cache with zero external dependencies.",
+            inputs=[
+                io.Model.Input(
+                    'model',
+                    tooltip="MiniMax-H3 model to accelerate with SLA+ / Sol-Attn sparse attention.",
+                ),
+                io.Combo.Input(
+                    'preset',
+                    options=list(PRESETS),
+                    default=PRESETS[0],
+                    tooltip="Quick attention preset (overrides manual settings below except manual): "
+                        "turbo_sla_balanced = best 4-8 step Turbo speed/quality balance (20% keep + step 0/last dense); "
+                        "turbo_sla_quality = higher 30% keep + first 25% steps dense; "
+                        "turbo_sla_fast = lighter 14%->20% keep for max speed; "
+                        "native_sol_balanced / quality = training-free sparse attention for base (non-Turbo) H3 checkpoints; "
+                        "vsa_10 = FastH3 3D block sparse (10% keep); "
+                        "dense_low_vram = exact dense attention split into 4 head chunks; "
+                        "manual = use all individual sliders below.",
+                ),
+                io.Combo.Input(
+                    'method',
+                    options=list(METHODS),
+                    optional=True,
+                    default="sla",
+                    tooltip="Manual only. Sparse attention algorithm: "
+                        "sla = token-level importance keep + pooled tail compensation; "
+                        "vsa = 3D spatial-temporal cube sparse (VSA); "
+                        "dense = exact dense attention.",
+                ),
+                io.Float.Input(
+                    'keep_percent',
+                    optional=True,
+                    default=20.0,
+                    min=0.5,
+                    max=95.0,
+                    step=0.5,
+                    tooltip="Manual only. Percentage of key/value blocks each query attends to (higher = closer to dense, slower).",
+                ),
+                io.Float.Input(
+                    'keep_percent_end',
+                    optional=True,
+                    default=-1.0,
+                    min=-1.0,
+                    max=95.0,
+                    step=0.5,
+                    tooltip="Manual only. End keep_percent at the final step when annealing across sampling (-1 = fixed at keep_percent).",
+                ),
+                io.Float.Input(
+                    'tau',
+                    optional=True,
+                    default=1.35,
+                    min=0.0,
+                    max=4.0,
+                    step=0.05,
+                    tooltip="Manual only. Temperature/sharpness of sparse block importance scores (0 = uniform, ~1.35 = balanced).",
+                ),
+                io.Float.Input(
+                    'tau_end',
+                    optional=True,
+                    default=-1.0,
+                    min=-1.0,
+                    max=4.0,
+                    step=0.05,
+                    tooltip="Manual only. End tau at the final step when annealing (-1 = fixed at tau).",
+                ),
+                io.Boolean.Input(
+                    'tail',
+                    optional=True,
+                    default=True,
+                    tooltip="Manual only. Add pooled summary of unselected tail tokens so distant context is never silently dropped.",
+                ),
+                io.Int.Input(
+                    'extra_tokens',
+                    optional=True,
+                    default=0,
+                    min=0,
+                    max=256,
+                    step=64,
+                    tooltip="Manual only. Extra learned/augmented sink tokens per block (0 = training-free, recommended).",
+                ),
+                io.Combo.Input(
+                    'sink_mode',
+                    options=list(SINK_MODES),
+                    optional=True,
+                    default=SINK_MODES[0],
+                    tooltip="Which conditioning prefix rows always receive exact dense attention: "
+                        "exact_prefix_rows (protect text/ref/audio sinks), exact_kv, exact_kv_and_rows, or off.",
+                ),
+                io.Int.Input(
+                    'dense_first_steps',
+                    optional=True,
+                    default=1,
+                    min=0,
+                    max=32,
+                    step=1,
+                    tooltip="Manual only. Run this many opening denoising steps in exact dense attention to lock early layout.",
+                ),
+                io.Float.Input(
+                    'dense_first_percent',
+                    optional=True,
+                    default=0.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    tooltip="Manual only. Run this fraction of early steps dense (0 = rely on dense_first_steps).",
+                ),
+                io.Int.Input(
+                    'dense_last_steps',
+                    optional=True,
+                    default=1,
+                    min=0,
+                    max=16,
+                    step=1,
+                    tooltip="Manual only. Run this many final steps dense to keep fine skin, lips, and edge detail sharp.",
+                ),
+                io.String.Input(
+                    'dense_layers',
+                    optional=True,
+                    default="0",
+                    multiline=False,
+                    tooltip="Manual only. Comma/range list of block indices forced to dense attention (e.g. '0' or '0-2,49').",
+                ),
+                io.Int.Input(
+                    'min_tokens',
+                    optional=True,
+                    default=12288,
+                    min=0,
+                    max=1 << 20,
+                    step=512,
+                    tooltip="Manual only. Fall back cleanly to dense below this token count (short clips get zero speedup overhead).",
+                ),
+                io.Boolean.Input(
+                    'chunked_qkv',
+                    optional=True,
+                    default=True,
+                    tooltip="Manual only. Stream QKV projection in 4096-row chunks directly into sol_attn_chunked (saves substantial VRAM).",
+                ),
+                io.Int.Input(
+                    'dense_head_chunks',
+                    optional=True,
+                    default=1,
+                    min=1,
+                    max=8,
+                    step=1,
+                    tooltip="Manual only. Split dense fallback attention across this many head chunks (4 cuts peak VRAM on small GPUs).",
+                ),
+                io.Combo.Input(
+                    'dense_backend',
+                    options=list(DENSE_BACKENDS),
+                    optional=True,
+                    default=DENSE_BACKENDS[0],
+                    tooltip="Manual only. Backend used on dense steps (comfy_kitchen_int8, comfy_kitchen, or torch_sdpa).",
+                ),
+                io.Boolean.Input(
+                    'disable_fp16_accum',
+                    optional=True,
+                    default=True,
+                    tooltip="Disable reduced-precision fp16/bf16 matmul accumulation during H3 steps for cleaner color & seam accuracy.",
+                ),
+                io.Float.Input(
+                    'start_percent',
+                    optional=True,
+                    default=0.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip="Sampling progress [0..1] where sparse attention becomes active (steps before this stay dense).",
+                ),
+                io.Float.Input(
+                    'end_percent',
+                    optional=True,
+                    default=1.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip="Sampling progress [0..1] where sparse attention stops (steps after this return to dense).",
+                ),
+                io.Boolean.Input(
+                    'verbose',
+                    optional=True,
+                    default=False,
+                    tooltip="Log per-step sparse vs dense attention calls to the ComfyUI console.",
+                ),
+            ],
+            outputs=[
+                io.Model.Output(display_name='model'),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        result = _HTCSparseAttentionImpl().apply(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
 
 
 NODE_CLASS_MAPPINGS = {"HTCSparseAttention": HTCSparseAttention}

@@ -20,6 +20,7 @@ import uuid
 
 import torch
 import torch.nn.functional as F
+from comfy_api.latest import io
 
 TAG = "HTCAdaLN"
 log = logging.getLogger(TAG)
@@ -552,36 +553,9 @@ def format_report(report):
     return line
 
 
-class HTCAdaLNFix:
+class _HTCAdaLNFixImpl:
     """Built-in MiniMax-H3 AdaLN LoRA port node (zero external dependency)."""
 
-    CATEGORY = "Hand Tie Clips"
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "apply"
-    DESCRIPTION = (
-        "Built-in MIT AdaLN LoRA porter for MiniMax-H3 (dense <-> pruned curve-form). "
-        "Note: HTCTokenLoRA already runs this automatically when adaln_fix='port'."
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL", {
-                    "tooltip": "MiniMax-H3 model carrying LoRA patches on the wire (dense or curve-form pruned checkpoint).",
-                }),
-                "mode": (list(MODES), {
-                    "default": MODES[0],
-                    "tooltip": (
-                        "How mismatched AdaLN LoRA patches are handled: "
-                        "port (recommended) converts dense <-> curve-form AdaLN deltas onto this checkpoint's time basis; "
-                        "strip removes mismatched AdaLN patches while keeping all other LoRA layers; "
-                        "off passes patches unchanged."
-                    ),
-                }),
-            }
-        }
 
     def apply(self, model, mode="port"):
         try:
@@ -592,6 +566,48 @@ class HTCAdaLNFix:
         except Exception as exc:
             print(f"[{TAG}] AdaLN LoRA fix skipped ({exc}); passing model unchanged.", flush=True)
             return (model,)
+
+
+class HTCAdaLNFix(io.ComfyNode, _HTCAdaLNFixImpl):
+    """V3 schema for HTCAdaLNFix; the implementation lives in _HTCAdaLNFixImpl.
+
+    Also inherits _HTCAdaLNFixImpl so existing callers of the V1 API (HTCAdaLNFix().apply(...),
+    HTCAdaLNFix.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='HTCAdaLNFix',
+            display_name='HTC AdaLN LoRA Fix (H3)',
+            category="Hand Tie Clips",
+            description="Built-in MIT AdaLN LoRA porter for MiniMax-H3 (dense <-> pruned curve-form). "
+                "Note: HTCTokenLoRA already runs this automatically when adaln_fix='port'.",
+            inputs=[
+                io.Model.Input(
+                    'model',
+                    tooltip="MiniMax-H3 model carrying LoRA patches on the wire (dense or curve-form pruned checkpoint).",
+                ),
+                io.Combo.Input(
+                    'mode',
+                    options=list(MODES),
+                    default=MODES[0],
+                    tooltip="How mismatched AdaLN LoRA patches are handled: "
+                        "port (recommended) converts dense <-> curve-form AdaLN deltas onto this checkpoint's time basis; "
+                        "strip removes mismatched AdaLN patches while keeping all other LoRA layers; "
+                        "off passes patches unchanged.",
+                ),
+            ],
+            outputs=[
+                io.Model.Output(display_name='model'),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        result = _HTCAdaLNFixImpl().apply(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
 
 
 NODE_CLASS_MAPPINGS = {"HTCAdaLNFix": HTCAdaLNFix}

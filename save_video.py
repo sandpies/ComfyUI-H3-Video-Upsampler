@@ -45,6 +45,7 @@ import av
 import numpy as np
 import torch
 import torch.nn.functional as F
+from comfy_api.latest import io
 
 TAG = "H3SaveVideo"
 
@@ -186,43 +187,9 @@ class _FrameGen:
             self._ctx.__exit__(None, None, None)
 
 
-class HTCSaveVideo:
+class _HTCSaveVideoImpl:
     """Encode frames (+ soundtrack) to MP4 in one streaming pass."""
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "images": ("IMAGE", {"tooltip": "The finished frames, e.g. from H3 Chain Preview."}),
-                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.001,
-                                  "tooltip": "Frame rate of the frames coming in (H3 renders 24)."}),
-                "frame_gen": (list(FRAME_GEN), {"default": "off", "tooltip": (
-                    "RTX frame generation inside the save: x2 turns 24 fps into 48. Replaces "
-                    "the RTX Video Frame Generation node without ever holding the doubled "
-                    "film in RAM. Needs an RTX card and the nvvfx package (installed with "
-                    "the NVIDIA RTX nodes).")}),
-                "codec": (["auto", "h264", "hevc", "av1"], {"default": "auto", "tooltip": (
-                    "auto = H.264, plays everywhere. HEVC and AV1 are smaller at the same "
-                    "quality. Encoded on the GPU's NVENC chip when there is one, else on the CPU.")}),
-                "quality": (list(QUALITY), {"default": "max", "tooltip": (
-                    "Constant quality, not a bitrate. max shows no loss on H3 output; "
-                    "archive is near-lossless and large; high is for sharing.")}),
-                "filename_prefix": ("STRING", {"default": "video/H3_upsampled",
-                    "tooltip": ("Start of the file name in ComfyUI's output folder. A folder "
-                                "works too: video/mine.")
-                }),
-            },
-            "optional": {
-                "audio": ("AUDIO", {"tooltip": "The soundtrack. Trimmed or padded to the picture."}),
-            },
-            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
-        }
-
-    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
-    RETURN_NAMES = ("video", "filepath", "report")
-    FUNCTION = "run"
-    CATEGORY = "video"
-    OUTPUT_NODE = True
 
     def run(self, images, fps, frame_gen, codec, quality, filename_prefix,
             audio=None, prompt=None, extra_pnginfo=None):
@@ -233,6 +200,85 @@ class HTCSaveVideo:
         parts = (images[s:s + chunk] for s in range(0, int(n_src), chunk))
         return encode_stream(parts, int(n_src), int(w_in), int(h_in), fps, frame_gen, codec,
                              quality, filename_prefix, audio, prompt, extra_pnginfo)
+
+
+class HTCSaveVideo(io.ComfyNode, _HTCSaveVideoImpl):
+    """V3 schema for HTCSaveVideo; the implementation lives in _HTCSaveVideoImpl.
+
+    Also inherits _HTCSaveVideoImpl so existing callers of the V1 API (HTCSaveVideo().run(...),
+    HTCSaveVideo.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3SaveVideo',
+            display_name='H3 Save Video (long-form)',
+            category="video",
+            is_output_node=True,
+            inputs=[
+                io.Image.Input(
+                    'images',
+                    tooltip="The finished frames, e.g. from H3 Chain Preview.",
+                ),
+                io.Float.Input(
+                    'fps',
+                    default=24.0,
+                    min=1.0,
+                    max=240.0,
+                    step=0.001,
+                    tooltip="Frame rate of the frames coming in (H3 renders 24).",
+                ),
+                io.Combo.Input(
+                    'frame_gen',
+                    options=list(FRAME_GEN),
+                    default="off",
+                    tooltip="RTX frame generation inside the save: x2 turns 24 fps into 48. Replaces "
+                    "the RTX Video Frame Generation node without ever holding the doubled "
+                    "film in RAM. Needs an RTX card and the nvvfx package (installed with "
+                    "the NVIDIA RTX nodes).",
+                ),
+                io.Combo.Input(
+                    'codec',
+                    options=["auto", "h264", "hevc", "av1"],
+                    default="auto",
+                    tooltip="auto = H.264, plays everywhere. HEVC and AV1 are smaller at the same "
+                    "quality. Encoded on the GPU's NVENC chip when there is one, else on the CPU.",
+                ),
+                io.Combo.Input(
+                    'quality',
+                    options=list(QUALITY),
+                    default="max",
+                    tooltip="Constant quality, not a bitrate. max shows no loss on H3 output; "
+                    "archive is near-lossless and large; high is for sharing.",
+                ),
+                io.String.Input(
+                    'filename_prefix',
+                    default="video/H3_upsampled",
+                    tooltip="Start of the file name in ComfyUI's output folder. A folder "
+                                "works too: video/mine.",
+                ),
+                io.Audio.Input(
+                    'audio',
+                    optional=True,
+                    tooltip="The soundtrack. Trimmed or padded to the picture.",
+                ),
+            ],
+            outputs=[
+                io.Video.Output(display_name='video'),
+                io.String.Output(display_name='filepath'),
+                io.String.Output(display_name='report'),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        kwargs['prompt'] = cls.hidden.prompt
+        kwargs['extra_pnginfo'] = cls.hidden.extra_pnginfo
+        result = _HTCSaveVideoImpl().run(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
 
 
 def encode_stream(parts, n_src, w_in, h_in, fps, frame_gen, codec, quality, filename_prefix,

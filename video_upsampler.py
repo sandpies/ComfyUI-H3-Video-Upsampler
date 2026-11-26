@@ -49,6 +49,7 @@ from . import face_pass as _fp
 from . import tiled_upsampler as _tu
 from . import upsample_ic as _ic
 from . import upscale_guide as _ug
+from comfy_api.latest import io
 
 TAG = "H3VideoUpsampler"
 GRID_PX = 32                # H3 canvases are multiples of 32 on both edges
@@ -490,123 +491,50 @@ def encode_video_streamed(vae, batches, seg=READ_FRAMES):
     return torch.cat(lats, dim=2), n, (src_w, src_h)
 
 
-class HTCVideoUpsampler:
+def _v3_accepted(fn, kwargs):
+    """The kwargs a V1 hook's signature accepts (all of them if it takes **kw)."""
+    import inspect as _inspect
+    params = _inspect.signature(fn).parameters
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _v3_inputs_from_v1(io, v1):
+    """V1 INPUT_TYPES dict -> (V3 inputs, hidden), same order. Unknown option = TypeError."""
+    import re as _re
+    rename = {"forceInput": "force_input", "dynamicPrompts": "dynamic_prompts",
+              "defaultInput": "default_input", "rawLink": "raw_link"}
+    by_type = {}
+    for attr in dir(io):
+        t = getattr(getattr(io, attr), "io_type", None)
+        if isinstance(t, str) and hasattr(getattr(io, attr), "Input"):
+            by_type.setdefault(t, getattr(io, attr))
+    inputs = []
+    for group in ("required", "optional"):
+        for name, spec in (v1.get(group) or {}).items():
+            kind = spec[0]
+            opts = dict(spec[1]) if len(spec) > 1 else {}
+            kw = {rename.get(k) or _re.sub(r"(?<!^)(?=[A-Z])", "_", k).lower(): v for k, v in opts.items()}
+            if group == "optional":
+                kw["optional"] = True
+            if isinstance(kind, (list, tuple)):
+                inputs.append(io.Combo.Input(name, options=list(kind), **kw))
+            elif kind == "COMBO":
+                multi = kw.pop("multiselect", False)
+                ctor = io.MultiCombo.Input if multi else io.Combo.Input
+                inputs.append(ctor(name, **kw))
+            elif kind in by_type:
+                inputs.append(by_type[kind].Input(name, **kw))
+            else:
+                inputs.append(io.Custom(kind).Input(name, **kw))
+    hidden = [io.Hidden(v) for v in (v1.get("hidden") or {}).values()]
+    return inputs, hidden
+
+
+class _HTCVideoUpsamplerImpl:
     """A finished H3 (or any) clip upsampled with the chain's upsampler."""
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        import comfy.samplers
-        import folder_paths
-        loras = [c for c in folder_paths.get_filename_list("loras") if c != "None"]
-        if REGEN2K_DEFAULT_LORA not in loras:
-            loras = [REGEN2K_DEFAULT_LORA] + loras
-        loras.append("None")
-        return {
-            "required": {
-                "model": ("MODEL", {"tooltip": (
-                    "The H3 model (Load Diffusion Model). regen2k: "
-                    "minimax_h3_fl2va_pruned_int8_convrot. ic: the official "
-                    "minimax_h3_ref2va_int8_convrot with no LoRAs (the node stops before any "
-                    "work and says so if the model cannot run ic).")}),
-                "vae": ("VAE", {"tooltip": (
-                    "The H3 video VAE. Tip: the sol-VAE (minimax_h3_sol_vae_fp16) made a "
-                    "whole run about 20% faster in tests, with hair edges a touch softer.")}),
-                "images": ("IMAGE", {"tooltip": (
-                    "The clip's frames. Any size: it's fitted to a multiple of 32 px.")}),
-                "upscale_model": (_tu.choices(), {
-                    "tooltip": (f"The latent upscaler, from models/{_tu.FOLDER}: "
-                                f"{_tu.UPSCALER_FILE} (3D, the recipe) or "
-                                f"{_tu.UPSCALER_2D_FILE} (2D, takes sharpness). Both from "
-                                "huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler.")}),
-                "megapixels": ("FLOAT", {
-                    "default": _tu.MEGAPIXELS, "min": 0.1, "max": 16.0, "step": 0.05,
-                    "tooltip": ("Output size. 2 = about 1920x1080. The shape of the clip "
-                                "is kept.")}),
-                "denoise": ("FLOAT", {
-                    "default": REGEN2K_DEFAULT_STRENGTH, "min": 0.0, "max": 1.0, "step": 0.005,
-                    "tooltip": ("How strongly the Regen2K LoRA re-draws detail. 0.8 = normal. "
-                                "0 = no re-draw, the clip is only enlarged (for both methods). "
-                                "Under ic any value above 0 runs the ic re-draw.")}),
-                "lora": (loras, {
-                    "default": REGEN2K_DEFAULT_LORA,
-                    "tooltip": (f"The re-draw LoRA, from models/loras. regen2k: "
-                                f"{REGEN2K_DEFAULT_LORA}. ic: pick an IC file here, or leave it "
-                                "and the IC LoRA is found by itself.")}),
-                "tile_tokens": ("INT", {
-                    "default": 0, "min": 0, "max": 1048576, "step": 1024,
-                    "tooltip": ("How much work goes to the GPU at once. 0 = automatic (recommended): "
-                                "it learns what your card can take and remembers it for the next "
-                                "run. A number fixes it: lower uses less VRAM, by cutting the clip "
-                                "into shorter pieces and then tiles.")}),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {
-                    "default": "euler", "tooltip": "Keep euler: Regen2K is tuned for it."}),
-                # Not named seed: ComfyUI hangs a randomize control on any
-                # widget called seed, and the default 42 should stay fixed.
-                "redraw_seed": ("INT", {
-                    "default": REGEN2K_SEED, "min": 0, "max": 0x7FFFFFFF,
-                    "tooltip": "Noise seed for the re-draw. Same seed, same result."}),
-                "attention": (list(_tu.ATTENTION_MODES), {
-                    "default": "sparse", "tooltip": _tu.ATTENTION_TIP}),
-                "chunk_join": (list(_tu.JOIN_MODES), {
-                    "default": "stepped", "tooltip": _tu.JOIN_TIP}),
-                "chunking": ("BOOLEAN", {"default": True, "tooltip": _tu.CHUNKING_TIP}),
-                "tiling": ("BOOLEAN", {"default": True, "tooltip": _tu.TILING_TIP}),
-                "redraw_start": ("FLOAT", {
-                    "default": 0.6, "min": 0.3, "max": 0.95, "step": 0.05,
-                    "tooltip": ("How much the re-draw is allowed to change. 0.6 (default) keeps "
-                                "faces close to your clip. 0.8 = the original Regen2K recipe: "
-                                "sharper, but faces drift more. Lower than 0.6 changes less "
-                                "again and sharpens less. regen2k; under ic: the face "
-                                "close-ups only.")}),
-                "redraw_steps": (list(REDRAW_STEPS), {
-                    "default": REDRAW_STEPS[0],
-                    "tooltip": ("Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
-                                "regen2k it looked the same in side-by-side tests, for ic it "
-                                "starts later, so less is re-drawn. Also the steps of the "
-                                "face close-ups.")}),
-                # appended last: widgets_values are positional
-                "method": (list(_ic.METHODS), {
-                    "default": _ic.METHODS[0], "tooltip": _ic.METHOD_TIP}),
-                # appended last: widgets_values are positional
-                "sharpness": ("INT", {
-                    "default": _tu.SHARPNESS, "min": 1, "max": _tu.SHARPNESS_MAX, "step": 1,
-                    "tooltip": _tu.SHARPNESS_TIP}),
-                # appended last: widgets_values are positional
-                "face_pass": (list(FACE_PASS_MODES), {
-                    "default": "auto", "tooltip": FACE_PASS_TIP}),
-            },
-            "optional": {
-                "clip": ("CLIP", {"tooltip": (
-                    "Optional, method ic only: the H3 text encoder (CLIPLoader, type minimax), "
-                    "shown each piece of the clip. Unwired, ic uses its task prompt encoded "
-                    "once (upsample_ic_task.safetensors) and no text encoder loads.")}),
-                "conditioning": ("CONDITIONING", {"tooltip": (
-                    "Optional: a text prompt (CLIPTextEncode with the H3 text encoder) "
-                    "describing the clip. Describe the look (\"2D anime, flat cel shading, "
-                    "clean line art\") more than the objects. Unwired = no prompt, which "
-                    "works well for most clips.")}),
-                "audio": ("AUDIO", {"tooltip": (
-                    "The clip's soundtrack. The re-draw listens to it to keep lip sync; "
-                    "the output soundtrack is the original, untouched.")}),
-                "fps": ("FLOAT", {"forceInput": True, "tooltip": (
-                    "The clip's frame rate (from Video Frames). Needed for lip sync when the "
-                    "clip isn't 24 fps. Unwired = 24. Tip: for 48 fps clips, take the frames "
-                    "at 24 fps and use Save Video's frame_gen x2: half the work, exact sync.")}),
-                "audio_vae": ("VAE", {"tooltip": (
-                    "The H3 audio VAE. Lets the re-draw hear the soundtrack, which keeps "
-                    "mouths in sync. Without it the re-draw hears silence.")}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
-    RETURN_NAMES = ("images", "audio", "report")
-    FUNCTION = "run"
-    CATEGORY = "video/upscale"
-    DESCRIPTION = (
-        "Upscales a finished clip to about 2 MP: H3's 3D latent upscaler enlarges it, then "
-        "the Regen2K LoRA re-draws fine detail in a few steps. Long clips are cut into "
-        "overlapping pieces that are re-drawn together, so there are no seams, and it adapts "
-        "to your GPU's memory by itself.")
 
     def run(self, model, vae, images, upscale_model, megapixels, denoise,
             lora, tile_tokens, sampler_name, redraw_seed=REGEN2K_SEED,
@@ -653,12 +581,222 @@ class HTCVideoUpsampler:
                 report)
 
 
+class HTCVideoUpsampler(io.ComfyNode, _HTCVideoUpsamplerImpl):
+    """V3 schema for HTCVideoUpsampler; the implementation lives in _HTCVideoUpsamplerImpl.
+
+    Also inherits _HTCVideoUpsamplerImpl so existing callers of the V1 API (HTCVideoUpsampler().run(...),
+    HTCVideoUpsampler.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        import comfy.samplers
+        import folder_paths
+        loras = [c for c in folder_paths.get_filename_list("loras") if c != "None"]
+        if REGEN2K_DEFAULT_LORA not in loras:
+            loras = [REGEN2K_DEFAULT_LORA] + loras
+        loras.append("None")
+        return io.Schema(
+            node_id='H3VideoUpsampler',
+            display_name='H3 Video Upsampler',
+            category="video/upscale",
+            description="Upscales a finished clip to about 2 MP: H3's 3D latent upscaler enlarges it, then "
+                "the Regen2K LoRA re-draws fine detail in a few steps. Long clips are cut into "
+                "overlapping pieces that are re-drawn together, so there are no seams, and it adapts "
+                "to your GPU's memory by itself.",
+            inputs=[
+                io.Model.Input(
+                    'model',
+                    tooltip="The H3 model (Load Diffusion Model). regen2k: "
+                    "minimax_h3_fl2va_pruned_int8_convrot. ic: the official "
+                    "minimax_h3_ref2va_int8_convrot with no LoRAs (the node stops before any "
+                    "work and says so if the model cannot run ic).",
+                ),
+                io.Vae.Input(
+                    'vae',
+                    tooltip="The H3 video VAE. Tip: the sol-VAE (minimax_h3_sol_vae_fp16) made a "
+                    "whole run about 20% faster in tests, with hair edges a touch softer.",
+                ),
+                io.Image.Input(
+                    'images',
+                    tooltip="The clip's frames. Any size: it's fitted to a multiple of 32 px.",
+                ),
+                io.Combo.Input(
+                    'upscale_model',
+                    options=_tu.choices(),
+                    tooltip=f"The latent upscaler, from models/{_tu.FOLDER}: "
+                                f"{_tu.UPSCALER_FILE} (3D, the recipe) or "
+                                f"{_tu.UPSCALER_2D_FILE} (2D, takes sharpness). Both from "
+                                "huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler.",
+                ),
+                io.Float.Input(
+                    'megapixels',
+                    default=_tu.MEGAPIXELS,
+                    min=0.1,
+                    max=16.0,
+                    step=0.05,
+                    tooltip="Output size. 2 = about 1920x1080. The shape of the clip "
+                                "is kept.",
+                ),
+                io.Float.Input(
+                    'denoise',
+                    default=REGEN2K_DEFAULT_STRENGTH,
+                    min=0.0,
+                    max=1.0,
+                    step=0.005,
+                    tooltip="How strongly the Regen2K LoRA re-draws detail. 0.8 = normal. "
+                                "0 = no re-draw, the clip is only enlarged (for both methods). "
+                                "Under ic any value above 0 runs the ic re-draw.",
+                ),
+                io.Combo.Input(
+                    'lora',
+                    options=loras,
+                    default=REGEN2K_DEFAULT_LORA,
+                    tooltip=f"The re-draw LoRA, from models/loras. regen2k: "
+                                f"{REGEN2K_DEFAULT_LORA}. ic: pick an IC file here, or leave it "
+                                "and the IC LoRA is found by itself.",
+                ),
+                io.Int.Input(
+                    'tile_tokens',
+                    default=0,
+                    min=0,
+                    max=1048576,
+                    step=1024,
+                    tooltip="How much work goes to the GPU at once. 0 = automatic (recommended): "
+                                "it learns what your card can take and remembers it for the next "
+                                "run. A number fixes it: lower uses less VRAM, by cutting the clip "
+                                "into shorter pieces and then tiles.",
+                ),
+                io.Combo.Input(
+                    'sampler_name',
+                    options=comfy.samplers.KSampler.SAMPLERS,
+                    default="euler",
+                    tooltip="Keep euler: Regen2K is tuned for it.",
+                ),
+                # Not named seed: ComfyUI hangs a randomize control on any
+                # widget called seed, and the default 42 should stay fixed.
+                io.Int.Input(
+                    'redraw_seed',
+                    default=REGEN2K_SEED,
+                    min=0,
+                    max=0x7FFFFFFF,
+                    tooltip="Noise seed for the re-draw. Same seed, same result.",
+                ),
+                io.Combo.Input(
+                    'attention',
+                    options=list(_tu.ATTENTION_MODES),
+                    default="sparse",
+                    tooltip=_tu.ATTENTION_TIP,
+                ),
+                io.Combo.Input(
+                    'chunk_join',
+                    options=list(_tu.JOIN_MODES),
+                    default="stepped",
+                    tooltip=_tu.JOIN_TIP,
+                ),
+                io.Boolean.Input('chunking', default=True, tooltip=_tu.CHUNKING_TIP),
+                io.Boolean.Input('tiling', default=True, tooltip=_tu.TILING_TIP),
+                io.Float.Input(
+                    'redraw_start',
+                    default=0.6,
+                    min=0.3,
+                    max=0.95,
+                    step=0.05,
+                    tooltip="How much the re-draw is allowed to change. 0.6 (default) keeps "
+                                "faces close to your clip. 0.8 = the original Regen2K recipe: "
+                                "sharper, but faces drift more. Lower than 0.6 changes less "
+                                "again and sharpens less. regen2k; under ic: the face "
+                                "close-ups only.",
+                ),
+                io.Combo.Input(
+                    'redraw_steps',
+                    options=list(REDRAW_STEPS),
+                    default=REDRAW_STEPS[0],
+                    tooltip="Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
+                                "regen2k it looked the same in side-by-side tests, for ic it "
+                                "starts later, so less is re-drawn. Also the steps of the "
+                                "face close-ups.",
+                ),
+                # appended last: widgets_values are positional
+                io.Combo.Input(
+                    'method',
+                    options=list(_ic.METHODS),
+                    default=_ic.METHODS[0],
+                    tooltip=_ic.METHOD_TIP,
+                ),
+                # appended last: widgets_values are positional
+                io.Int.Input(
+                    'sharpness',
+                    default=_tu.SHARPNESS,
+                    min=1,
+                    max=_tu.SHARPNESS_MAX,
+                    step=1,
+                    tooltip=_tu.SHARPNESS_TIP,
+                ),
+                # appended last: widgets_values are positional
+                io.Combo.Input(
+                    'face_pass',
+                    options=list(FACE_PASS_MODES),
+                    default="auto",
+                    tooltip=FACE_PASS_TIP,
+                ),
+                io.Clip.Input(
+                    'clip',
+                    optional=True,
+                    tooltip="Optional, method ic only: the H3 text encoder (CLIPLoader, type minimax), "
+                    "shown each piece of the clip. Unwired, ic uses its task prompt encoded "
+                    "once (upsample_ic_task.safetensors) and no text encoder loads.",
+                ),
+                io.Conditioning.Input(
+                    'conditioning',
+                    optional=True,
+                    tooltip="Optional: a text prompt (CLIPTextEncode with the H3 text encoder) "
+                    "describing the clip. Describe the look (\"2D anime, flat cel shading, "
+                    "clean line art\") more than the objects. Unwired = no prompt, which "
+                    "works well for most clips.",
+                ),
+                io.Audio.Input(
+                    'audio',
+                    optional=True,
+                    tooltip="The clip's soundtrack. The re-draw listens to it to keep lip sync; "
+                    "the output soundtrack is the original, untouched.",
+                ),
+                io.Float.Input(
+                    'fps',
+                    optional=True,
+                    force_input=True,
+                    tooltip="The clip's frame rate (from Video Frames). Needed for lip sync when the "
+                    "clip isn't 24 fps. Unwired = 24. Tip: for 48 fps clips, take the frames "
+                    "at 24 fps and use Save Video's frame_gen x2: half the work, exact sync.",
+                ),
+                io.Vae.Input(
+                    'audio_vae',
+                    optional=True,
+                    tooltip="The H3 audio VAE. Lets the re-draw hear the soundtrack, which keeps "
+                    "mouths in sync. Without it the re-draw hears silence.",
+                ),
+            ],
+            outputs=[
+                io.Image.Output(display_name='images'),
+                io.Audio.Output(display_name='audio'),
+                io.String.Output(display_name='report'),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        result = _HTCVideoUpsamplerImpl().run(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
+
+
 FACE_PASS_MODES = ("auto", "on", "off")
 FACE_PASS_TIP = (
     "The small-face close-up re-draw (faces about 280 px tall or less in the output). "
     "auto = with regen2k only, as before. on = also under ic: there only faces under "
     "about 220 px, at most 2, drawn by Regen2K (ic keeps larger faces well and costs "
-    "more). off = never, which saves its time.")
+    "more). off = never, which saves its time. Needs opencv-python; the YuNet face "
+    "detector (232 KB) downloads itself once.")
 
 
 def face_pass_on(face_pass, method, denoise):
@@ -907,12 +1045,11 @@ def _redraw_ic(model, video, latent, n, src_size, length, latent_t, audio_t, ups
     return vid, report
 
 
-
-class HTCVideoUpsamplerToFile:
+class _HTCVideoUpsamplerToFileImpl:
     """The upsampler from a video file to an MP4, never holding the film's frames."""
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def _v1_input_types(cls):
         base = HTCVideoUpsampler.INPUT_TYPES()
         req = {"video": ("VIDEO", {"tooltip": (
             "The clip (Load Video or Load Video (path)). It's read a piece at a time, so "
@@ -951,15 +1088,6 @@ class HTCVideoUpsamplerToFile:
         return {"required": req, "optional": opt,
                 "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
 
-    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
-    RETURN_NAMES = ("video", "filepath", "report")
-    FUNCTION = "run"
-    CATEGORY = "video/upscale"
-    OUTPUT_NODE = True
-    DESCRIPTION = (
-        "The upsampler from a video file straight to an MP4. It works a piece at a time, "
-        "so RAM stays low however long the clip is. Same result as the IMAGE node; frame "
-        "rate and sound come from the file.")
 
     def run(self, video, model, vae, upscale_model, megapixels, denoise, lora, tile_tokens,
             sampler_name, redraw_seed=REGEN2K_SEED, attention="sparse",
@@ -1069,6 +1197,42 @@ class HTCVideoUpsamplerToFile:
         return {"ui": res["ui"], "result": (_video, path, report)}
 
 
+class HTCVideoUpsamplerToFile(io.ComfyNode, _HTCVideoUpsamplerToFileImpl):
+    """V3 schema for HTCVideoUpsamplerToFile; the implementation lives in _HTCVideoUpsamplerToFileImpl.
+
+    Also inherits _HTCVideoUpsamplerToFileImpl so existing callers of the V1 API (HTCVideoUpsamplerToFile().run(...),
+    HTCVideoUpsamplerToFile.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        inputs, hidden = _v3_inputs_from_v1(io, _HTCVideoUpsamplerToFileImpl._v1_input_types())
+        return io.Schema(
+            node_id='H3VideoUpsamplerToFile',
+            display_name='H3 Video Upsampler (file to file)',
+            category="video/upscale",
+            description="The upsampler from a video file straight to an MP4. It works a piece at a time, "
+                "so RAM stays low however long the clip is. Same result as the IMAGE node; frame "
+                "rate and sound come from the file.",
+            is_output_node=True,
+            inputs=inputs,
+            outputs=[
+                io.Video.Output(display_name='video'),
+                io.String.Output(display_name='filepath'),
+                io.String.Output(display_name='report'),
+            ],
+            hidden=hidden,
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        kwargs['prompt'] = cls.hidden.prompt
+        kwargs['extra_pnginfo'] = cls.hidden.extra_pnginfo
+        result = _HTCVideoUpsamplerToFileImpl().run(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
+
+
 def _paste_stream(slices, jobs, sx, sy):
     """decode_slices() with the small-face close-ups blended into each slice."""
     at = 0
@@ -1148,52 +1312,10 @@ def frames_to_image(parts):
     return out
 
 
-class HTCVideoFrames:
+class _HTCVideoFramesImpl:
     """Get Video Components, lean: a window, a frame rate and a size, applied
     while decoding."""
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video": ("VIDEO", {"tooltip": "From Load Video (or any VIDEO)."}),
-                "start_seconds": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.01,
-                    "tooltip": "Skip this much of the video first."}),
-                "duration_seconds": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.5,
-                    "tooltip": ("How much to take from start_seconds on. 0 = to the end. With "
-                                "snap_to_h3 the frame count is rounded to the nearest length H3 "
-                                "uses natively (30 s at 24 fps = 719 frames); the log says what "
-                                "you got.")}),
-                "frame_rate": (list(FRAME_RATES), {
-                    "default": FRAME_RATES[0],
-                    "tooltip": ("source = every frame. 24 = re-timed to H3's own rate while "
-                                "decoding (nearest frame: dropped above 24, repeated below); "
-                                "the duration and the soundtrack's sync are kept.")}),
-                "resize": (list(RESIZE_MODES), {
-                    "default": "none",
-                    "tooltip": ("Shrink while decoding, aspect kept, never enlarging: to "
-                                "resize_value megapixels, or the long edge to resize_value px.")}),
-                "resize_value": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 16384.0, "step": 0.01,
-                    "tooltip": "Megapixels (resize = megapixels) or pixels (resize = long edge)."}),
-                "snap_to_h3": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": ("Round duration_seconds to the nearest frame count H3 uses "
-                                "natively (17n + 5), so nothing is padded. Off = exactly "
-                                "seconds x fps.")}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "VIDEO")
-    RETURN_NAMES = ("images", "audio", "fps", "frame_count", "video")
-    FUNCTION = "run"
-    CATEGORY = "video/upscale"
-    DESCRIPTION = (
-        "Get Video Components without the RAM bill: start, duration, a 24 fps re-time and a "
-        "resize are applied while decoding, so skipped frames are never held, and the frames "
-        "are filled into the IMAGE once (peak about 1.25x the output).")
 
     def run(self, video, start_seconds=0.0, duration_seconds=0.0, frame_rate=FRAME_RATES[0],
             resize="none", resize_value=1.0, snap_to_h3=True):
@@ -1280,6 +1402,90 @@ class HTCVideoFrames:
         return (images, audio, fps, n, video)
 
 
+class HTCVideoFrames(io.ComfyNode, _HTCVideoFramesImpl):
+    """V3 schema for HTCVideoFrames; the implementation lives in _HTCVideoFramesImpl.
+
+    Also inherits _HTCVideoFramesImpl so existing callers of the V1 API (HTCVideoFrames().run(...),
+    HTCVideoFrames.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3VideoFrames',
+            display_name='H3 Video Frames (lean)',
+            category="video/upscale",
+            description="Get Video Components without the RAM bill: start, duration, a 24 fps re-time and a "
+                "resize are applied while decoding, so skipped frames are never held, and the frames "
+                "are filled into the IMAGE once (peak about 1.25x the output).",
+            inputs=[
+                io.Video.Input('video', tooltip="From Load Video (or any VIDEO)."),
+                io.Float.Input(
+                    'start_seconds',
+                    default=0.0,
+                    min=0.0,
+                    max=86400.0,
+                    step=0.01,
+                    tooltip="Skip this much of the video first.",
+                ),
+                io.Float.Input(
+                    'duration_seconds',
+                    default=0.0,
+                    min=0.0,
+                    max=86400.0,
+                    step=0.5,
+                    tooltip="How much to take from start_seconds on. 0 = to the end. With "
+                                "snap_to_h3 the frame count is rounded to the nearest length H3 "
+                                "uses natively (30 s at 24 fps = 719 frames); the log says what "
+                                "you got.",
+                ),
+                io.Combo.Input(
+                    'frame_rate',
+                    options=list(FRAME_RATES),
+                    default=FRAME_RATES[0],
+                    tooltip="source = every frame. 24 = re-timed to H3's own rate while "
+                                "decoding (nearest frame: dropped above 24, repeated below); "
+                                "the duration and the soundtrack's sync are kept.",
+                ),
+                io.Combo.Input(
+                    'resize',
+                    options=list(RESIZE_MODES),
+                    default="none",
+                    tooltip="Shrink while decoding, aspect kept, never enlarging: to "
+                                "resize_value megapixels, or the long edge to resize_value px.",
+                ),
+                io.Float.Input(
+                    'resize_value',
+                    default=1.0,
+                    min=0.0,
+                    max=16384.0,
+                    step=0.01,
+                    tooltip="Megapixels (resize = megapixels) or pixels (resize = long edge).",
+                ),
+                io.Boolean.Input(
+                    'snap_to_h3',
+                    default=True,
+                    tooltip="Round duration_seconds to the nearest frame count H3 uses "
+                                "natively (17n + 5), so nothing is padded. Off = exactly "
+                                "seconds x fps.",
+                ),
+            ],
+            outputs=[
+                io.Image.Output(display_name='images'),
+                io.Audio.Output(display_name='audio'),
+                io.Float.Output(display_name='fps'),
+                io.Int.Output(display_name='frame_count'),
+                io.Video.Output(display_name='video'),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        result = _HTCVideoFramesImpl().run(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
+
+
 # --- a video from a path ----------------------------------------------------
 #
 # Core's Load Video reads from ComfyUI's input folder, and a browser upload
@@ -1352,25 +1558,9 @@ def describe_video(info):
             f"audio: {info['audio']}, {info['size_mb']:.0f} MB")
 
 
-class HTCLoadVideoPath:
+class _HTCLoadVideoPathImpl:
     """A VIDEO from a file path: no upload, no copy, no size limit."""
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {"path": ("STRING", {
-            "default": "", "multiline": False,
-            "placeholder": "D:/videos/clip.mp4 (or a name in ComfyUI/input)",
-            "tooltip": ("The video file. Paste a full path (quotes from Copy as path are fine), "
-                        "or a name relative to ComfyUI's input folder. Read in place: nothing is "
-                        "uploaded or copied, so there is no upload size limit.")})}}
-
-    RETURN_TYPES = ("VIDEO", "FLOAT", "INT", "STRING")
-    RETURN_NAMES = ("video", "fps", "frame_count", "info")
-    FUNCTION = "run"
-    CATEGORY = "video/upscale"
-    DESCRIPTION = ("Load Video without the upload: reads the file where it is (no 100 MB upload "
-                   "limit, no copy into input/), and reports its size, frame rate, length, codec "
-                   "and audio.")
 
     @classmethod
     def IS_CHANGED(cls, path):
@@ -1404,6 +1594,56 @@ class HTCLoadVideoPath:
         print(f"[{TAG}] {text}", flush=True)
         return {"ui": {"text": [text]},
                 "result": (InputImpl.VideoFromFile(p), float(info["fps"]), int(info["frames"]), text)}
+
+
+class HTCLoadVideoPath(io.ComfyNode, _HTCLoadVideoPathImpl):
+    """V3 schema for HTCLoadVideoPath; the implementation lives in _HTCLoadVideoPathImpl.
+
+    Also inherits _HTCLoadVideoPathImpl so existing callers of the V1 API (HTCLoadVideoPath().run(...),
+    HTCLoadVideoPath.<helper>) keep working; core sees only the V3 hooks below."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='H3LoadVideoPath',
+            display_name='H3 Load Video (path)',
+            category="video/upscale",
+            description="Load Video without the upload: reads the file where it is (no 100 MB upload "
+                "limit, no copy into input/), and reports its size, frame rate, length, codec "
+                "and audio.",
+            inputs=[
+                io.String.Input(
+                    'path',
+                    default="",
+                    multiline=False,
+                    placeholder="D:/videos/clip.mp4 (or a name in ComfyUI/input)",
+                    tooltip="The video file. Paste a full path (quotes from Copy as path are fine), "
+                        "or a name relative to ComfyUI's input folder. Read in place: nothing is "
+                        "uploaded or copied, so there is no upload size limit.",
+                ),
+            ],
+            outputs=[
+                io.Video.Output(display_name='video'),
+                io.Float.Output(display_name='fps'),
+                io.Int.Output(display_name='frame_count'),
+                io.String.Output(display_name='info'),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        result = _HTCLoadVideoPathImpl().run(**kwargs)
+        if isinstance(result, dict):
+            return io.NodeOutput.from_dict(result)
+        return io.NodeOutput(*result) if result is not None else io.NodeOutput()
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs):
+        return _HTCLoadVideoPathImpl.IS_CHANGED(**_v3_accepted(_HTCLoadVideoPathImpl.IS_CHANGED, kwargs))
+
+    @classmethod
+    def validate_inputs(cls, **kwargs):
+        return _HTCLoadVideoPathImpl.VALIDATE_INPUTS(**_v3_accepted(_HTCLoadVideoPathImpl.VALIDATE_INPUTS, kwargs))
 
 NODE_CLASS_MAPPINGS = {"H3VideoUpsampler": HTCVideoUpsampler,
                        "H3VideoUpsamplerToFile": HTCVideoUpsamplerToFile,
