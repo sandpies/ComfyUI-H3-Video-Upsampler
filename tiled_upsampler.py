@@ -1713,6 +1713,9 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed, lock=No
         def callback(step, x0, x, total_steps):
             preview = None
             if previewer:
+                # x0 is the AV NestedTensor; previewers take the video latent (as latent_preview.prepare_callback does).
+                if getattr(x0, "is_nested", False):
+                    x0 = x0.tensors[0]
                 try:
                     preview = previewer.decode_latent_to_preview_image("JPEG", x0)
                 except Exception:
