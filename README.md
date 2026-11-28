@@ -101,5 +101,5 @@ whole chain. Latent upscaler network: LBH-123-AI. Upscale recipe: bbaudio-2025's
 MMH3 Ultimate Upscale. Open-H3-Regenerate-2K and Regenerate-2K-IC: NVlabs
 (`Efficient-Large-Model`); IC LoRA resize and core's H3 latent upscaler: Kijai.
 HyperFlow: videorebirth. LMS Sharp and the guide layout: Alissonerdx. Face detector:
-YuNet (Shiqi Yu, opencv_zoo). Audio-end fix: plz12345. Small-face pass under `ic`:
+YuNet (Shiqi Yu, opencv_zoo). Audio-end and TAESD preview fixes: plz12345. Small-face pass under `ic`:
 requested by Airsiren. See `THIRD_PARTY_NOTICES.md`.
